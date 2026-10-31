@@ -12,8 +12,9 @@ with "No sign in" + request header  X-API-Key: <MCP_AUTH_TOKEN>.
 Environment variables
 ---------------------
 FIELDNET_REFRESH_TOKEN   required  refresh token copied from the web app's localStorage
-FIELDNET_ORG_ID          required  organization GUID (Hyer Farms 2 = 937981d9-...)
-MCP_AUTH_TOKEN           required  any long random string; Claude sends it as a bearer token
+MCP_AUTH_TOKEN           required  any long random string; Claude sends it in the X-API-Key header
+FIELDNET_ORG_ID          optional  organization GUID; auto-detected from the account if unset
+FIELDNET_TZ              optional  IANA timezone for date ranges (default America/Los_Angeles)
 FIELDNET_CLIENT_ID       optional  defaults to the NextGen web app's public client id
 PORT                     optional  Render sets this automatically
 
@@ -121,9 +122,27 @@ async def api_get(path: str, params: dict[str, Any] | None = None) -> Any:
 _pivot_cache: dict[str, Any] = {"at": 0.0, "list": []}
 
 
+async def org_id() -> str:
+    """Return FIELDNET_ORG_ID, or discover it from the account's organizations."""
+    global ORG_ID
+    if ORG_ID:
+        return ORG_ID
+    orgs = await api_get("/organizations") or []
+    if isinstance(orgs, dict):
+        orgs = orgs.get("items", [])
+    customers = [o for o in orgs if "customer" in (o.get("type") or [])] or orgs
+    if not customers:
+        raise RuntimeError("No FieldNET organization found for this account; set FIELDNET_ORG_ID.")
+    ORG_ID = customers[0]["id"]
+    names = ", ".join(f"{o.get('name')} ({o.get('id')})" for o in customers)
+    print(f"Using FieldNET organization {customers[0].get('name')} ({ORG_ID}). "
+          f"Available: {names}", flush=True)
+    return ORG_ID
+
+
 async def get_pivots(max_age_s: int = 60) -> list[dict[str, Any]]:
     if time.time() - _pivot_cache["at"] > max_age_s:
-        data = await api_get("/irrigation-controllers", {"organization-id": ORG_ID, "page-size": 1000})
+        data = await api_get("/irrigation-controllers", {"organization-id": await org_id(), "page-size": 1000})
         _pivot_cache["list"] = data if isinstance(data, list) else data.get("items", [])
         _pivot_cache["at"] = time.time()
     return _pivot_cache["list"]
@@ -426,6 +445,7 @@ async def irrigation_overview(from_date: str | None = None, to_date: str | None 
     """
     start, end = _range(from_date, to_date, 30)
     s_iso, e_iso = _iso_bounds(start, end)
+    org = await org_id()
     all_p = await get_pivots(max_age_s=600)
     targets = all_p if not pivots else [await resolve_pivot(n) for n in pivots]
     sem = asyncio.Semaphore(8)
@@ -434,7 +454,7 @@ async def irrigation_overview(from_date: str | None = None, to_date: str | None 
         async with sem:
             try:
                 r = await api_get(
-                    f"/irrigation-systems/{ORG_ID}/overview-report/{p['id']}",
+                    f"/irrigation-systems/{org}/overview-report/{p['id']}",
                     {"from": s_iso, "to": e_iso, "from-date": start.isoformat(), "to-date": end.isoformat()},
                 )
             except Exception as e:  # noqa: BLE001

@@ -9,11 +9,9 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.7"
-      - key: FIELDNET_ORG_ID
-        value: 937981d9-f6e4-4d24-9e7f-186e554b559a
       - key: FIELDNET_TZ
         value: America/Los_Angeles
       - key: FIELDNET_REFRESH_TOKEN
         sync: false
       - key: MCP_AUTH_TOKEN
-        sync: false
+        generateValue: true
