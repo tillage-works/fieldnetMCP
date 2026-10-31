@@ -40,7 +40,7 @@ Team plan: the account Owner goes to **Organization settings → Connectors → 
 | Name | FieldNET |
 | Remote MCP server URL | `https://<service>.onrender.com/mcp` |
 | Authentication | No sign in |
-| Request header | `Authorization: Bearer <MCP_AUTH_TOKEN>` |
+| Request header | name `X-API-Key`, value `<MCP_AUTH_TOKEN>` (just the key, no "Bearer") |
 
 Then each member opens Customize → Connectors and clicks Connect on FieldNET.
 

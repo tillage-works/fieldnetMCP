@@ -7,7 +7,7 @@ as a small set of read-only MCP tools, so Claude can answer questions like
 "how much water has M-32 had since Oct 1" from any chat or Cowork session.
 
 Deploy on Render (or anywhere) and add it to Claude as a custom connector
-with "No sign in" + request header  Authorization: Bearer <MCP_AUTH_TOKEN>.
+with "No sign in" + request header  X-API-Key: <MCP_AUTH_TOKEN>.
 
 Environment variables
 ---------------------
@@ -486,11 +486,22 @@ async def pivot_history(pivot: str, hours: int = 48) -> dict[str, Any]:
 
 
 class BearerAuth(BaseHTTPMiddleware):
+    """Accepts the shared key as  X-API-Key: <key>  (preferred for Claude custom
+    connectors, which may not forward a custom Authorization header), or as
+    Authorization: Bearer <key>, or as ?key=<key> for quick manual tests."""
+
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
-        if request.url.path in ("/", "/health"):
+        path = request.url.path
+        if path in ("/", "/health"):
             return await call_next(request)
-        auth = request.headers.get("authorization", "")
-        if not MCP_AUTH_TOKEN or auth != f"Bearer {MCP_AUTH_TOKEN}":
+        if path.startswith("/.well-known/"):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        presented = (
+            request.headers.get("x-api-key")
+            or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            or request.query_params.get("key", "")
+        )
+        if not MCP_AUTH_TOKEN or presented != MCP_AUTH_TOKEN:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 
