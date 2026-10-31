@@ -31,8 +31,11 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import json
+
 import httpx
-from mcp.server.fastmcp import FastMCP
+import websockets
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -42,12 +45,16 @@ from starlette.responses import JSONResponse, PlainTextResponse
 # Config
 # ---------------------------------------------------------------------------
 
-API = "https://v2.api.myfieldnet.com"
+API = os.environ.get("FIELDNET_API_URL", "https://v2.api.myfieldnet.com")
 CLIENT_ID = os.environ.get("FIELDNET_CLIENT_ID", "1f5ef800-1061-4146-95b1-42139f1f187a")
 ORG_ID = os.environ.get("FIELDNET_ORG_ID", "")
 REFRESH_TOKEN = os.environ.get("FIELDNET_REFRESH_TOKEN", "")
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+# Optional. When set, the control tools below are enabled, and only for requests
+# that present THIS key (not the read-only key). Leave unset for a read-only server.
+MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
 TZ = ZoneInfo(os.environ.get("FIELDNET_TZ", "America/Los_Angeles"))
+WS_URL = os.environ.get("FIELDNET_WS_URL", "wss://v2.api.myfieldnet.com/websocket")
 
 MM_PER_IN = 25.4
 PSI_PER_BAR = 14.5038
@@ -313,7 +320,10 @@ mcp = FastMCP(
         "Read-only access to Lindsay FieldNET pivot data for this farm. Pivots are named like "
         "M-31, W-2, R-12. Angles are degrees clockwise from north (0 = north). Depths are inches, "
         "pressure psi, speed percent of full. Dates are YYYY-MM-DD in America/Los_Angeles. "
-        "Nothing here can control equipment."
+        + ("Control tools (start/stop/speed/service stop/plan/toggles) are available to connectors "
+           "that hold the write key; each one previews the change and only sends it when called "
+           "again with confirm=true. Always show the user the preview and get a clear yes before confirming."
+           if MCP_WRITE_TOKEN else "Nothing here can control equipment.")
     ),
     stateless_http=True,
     json_response=True,
@@ -505,6 +515,285 @@ async def pivot_history(pivot: str, hours: int = 48) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Control (write) tools — only registered when MCP_WRITE_TOKEN is set
+# ---------------------------------------------------------------------------
+#
+# How the web app controls a pivot: it opens the WebSocket, authenticates,
+# subscribes to the pivot's "pivot-status", copies the current state into a
+# view-model, changes the fields the user touched, and sends
+#   {"command_type": "pivot-control-dashboard-apply", "payload": {...}}
+# with the full view-model. We do exactly the same.
+#
+# Speed math (from the app):  rate is a 0.01–1 fraction of full speed.
+#   circle_time_hours = full_run_time_s / 3600 / rate
+#   depth_m           = rate_conversion_factor / rate
+#
+# Guardrails: a separate key (MCP_WRITE_TOKEN); every tool previews the change
+# and does nothing until called again with confirm=true; every applied command
+# is logged.
+
+DIRECTION_KEYS = ("forward", "reverse", "stopped")
+IN_PER_M = 39.3701
+
+
+def _presented_key(ctx: Context | None) -> str:
+    try:
+        req = ctx.request_context.request  # type: ignore[union-attr]
+        return (req.headers.get("x-api-key")
+                or req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+                or req.query_params.get("key", ""))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _require_write(ctx: Context | None) -> None:
+    if not MCP_WRITE_TOKEN:
+        raise PermissionError("Control tools are disabled on this server (MCP_WRITE_TOKEN not set).")
+    if _presented_key(ctx) != MCP_WRITE_TOKEN:
+        raise PermissionError("This connector only has read access. Control requires the write key.")
+
+
+async def ws_session(timeout: float = 15.0):
+    """Open, authenticate and return a websocket connection to FieldNET."""
+    tok = await tokens.access_token(_http)
+    ws = await websockets.connect(WS_URL, open_timeout=timeout, close_timeout=5)
+    await ws.send(json.dumps({"command_type": "auth-request", "token": tok, "organization_id": await org_id()}))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.time())))
+        if msg.get("event_type") == "auth-result":
+            if msg.get("payload") == "success":
+                return ws
+            await ws.close()
+            raise RuntimeError(f"FieldNET websocket auth failed: {msg}")
+    await ws.close()
+    raise TimeoutError("FieldNET websocket auth timed out")
+
+
+async def ws_wait(ws, predicate, timeout: float):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=max(0.1, deadline - time.time()))
+        except asyncio.TimeoutError:
+            break
+        try:
+            msg = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if predicate(msg):
+            return msg
+    return None
+
+
+async def live_status(ws, equipment_id: str, timeout: float = 10.0) -> dict[str, Any]:
+    await ws.send(json.dumps({"command_type": "subscribe", "id": equipment_id, "event_type": "pivot-status"}))
+    msg = await ws_wait(ws, lambda m: m.get("event_type") == "pivot-status"
+                        and (m.get("payload") or {}).get("id") == equipment_id, timeout)
+    if not msg:
+        raise TimeoutError("No pivot-status received for this pivot (is the RTU online?)")
+    return msg["payload"]
+
+
+def _rate_from(status: dict[str, Any], speed_pct: float | None, depth_in: float | None, hours: float | None) -> float | None:
+    given = [v is not None for v in (speed_pct, depth_in, hours)]
+    if sum(given) == 0:
+        return None
+    if sum(given) > 1:
+        raise ValueError("Give only one of speed_pct, depth_in or hours.")
+    if speed_pct is not None:
+        rate = speed_pct / 100.0
+    elif depth_in is not None:
+        rcf = status.get("rate_conversion_factor")
+        if not rcf:
+            raise ValueError("This pivot has no depth calibration (rate_conversion_factor); use speed_pct.")
+        rate = rcf / (depth_in / IN_PER_M)
+    else:
+        frt = status.get("full_run_time")
+        if not frt:
+            raise ValueError("This pivot has no full-circle time; use speed_pct.")
+        rate = (frt / 3600.0) / hours  # type: ignore[operator]
+    return max(0.01, min(1.0, round(rate, 4)))
+
+
+def _describe(status: dict[str, Any], rate: float | None = None) -> dict[str, Any]:
+    r = status.get("rate") if rate is None else rate
+    rcf, frt = status.get("rate_conversion_factor"), status.get("full_run_time")
+    return {
+        "direction_key": status.get("direction_key"),
+        "status": status.get("operational_status"),
+        "angle_deg": status.get("current_angle"),
+        "water_on": status.get("water_on"),
+        "speed_pct": pct(r),
+        "depth_in": round(rcf / r * IN_PER_M, 2) if (rcf and r) else None,
+        "circle_hours": round(frt / 3600.0 / r, 1) if (frt and r) else None,
+        "service_stop_deg": status.get("service_stop"),
+        "service_stop_repeat": status.get("service_stop_repeat_on"),
+        "plan_id": status.get("current_plan_id"),
+        "auto_reverse": status.get("auto_reverse_on"),
+        "auto_restart": status.get("auto_restart_on"),
+        "accessory_1": status.get("accessory_1_on"),
+        "rtu_online": status.get("rtu_online"),
+    }
+
+
+async def _plan_id_for(equipment_id: str, plan: str | None) -> str | None:
+    """Resolve a plan name (or 'manual') to its id."""
+    if plan is None:
+        return None
+    if plan.strip().lower() in ("manual", "manual mode", "none", ""):
+        return None
+    plans = await api_get(f"/irrigation-controllers/{equipment_id}/plans") or []
+    if isinstance(plans, dict):
+        plans = plans.get("items", [])
+    for p in plans:
+        if (p.get("name") or "").strip().lower() == plan.strip().lower() or p.get("id") == plan:
+            return p["id"]
+    names = ", ".join(p.get("name") or "?" for p in plans)
+    raise ValueError(f"No plan named '{plan}' on this pivot. Plans: {names or '(none)'}")
+
+
+async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confirm: bool,
+                 speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
+                 plan: str | None = None) -> dict[str, Any]:
+    _require_write(ctx)
+    p = await resolve_pivot(pivot)
+    eid = p["id"]
+    ws = await ws_session()
+    try:
+        status = await live_status(ws, eid)
+        rate = _rate_from(status, speed_pct, depth_in, hours)
+        if plan is not None:
+            changes["plan_id"] = await _plan_id_for(eid, plan)
+        if rate is not None:
+            changes["rate"] = rate
+        payload = {
+            "equipment_id": eid,
+            "direction_key": status.get("direction_key"),
+            "plan_id": status.get("current_plan_id"),
+            "aux_1_on": status.get("accessory_1_on"),
+            "chem_stop": status.get("chem_stop"),
+            "auto_restart_on": status.get("auto_restart_on"),
+            "auto_reverse_on": status.get("auto_reverse_on"),
+            "service_stop_angle": status.get("service_stop"),
+            "service_stop_repeat_on": status.get("service_stop_repeat_on"),
+            "water_on": status.get("water_on"),
+            "rate": status.get("rate"),
+        }
+        before = _describe(status)
+        payload.update(changes)
+        after_status = dict(status, **{
+            "direction_key": payload["direction_key"], "water_on": payload["water_on"], "rate": payload["rate"],
+            "service_stop": payload["service_stop_angle"], "service_stop_repeat_on": payload["service_stop_repeat_on"],
+            "current_plan_id": payload["plan_id"], "auto_reverse_on": payload["auto_reverse_on"],
+            "auto_restart_on": payload["auto_restart_on"], "accessory_1_on": payload["aux_1_on"],
+        })
+        after = _describe(after_status)
+        diff = {k: {"from": before[k], "to": after[k]} for k in after if before.get(k) != after.get(k)
+                and k not in ("status", "angle_deg", "rtu_online")}
+        if not status.get("rtu_online"):
+            return {"pivot": p["name"], "applied": False, "error": "RTU is offline; command would not be delivered.", "current": before}
+        if not confirm:
+            return {"pivot": p["name"], "applied": False, "preview": True, "current": before,
+                    "would_change": diff, "next_step": "Call again with confirm=true to send this to the pivot."}
+        if not diff:
+            return {"pivot": p["name"], "applied": False, "note": "No change from current state.", "current": before}
+        print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} {json.dumps(diff)}", flush=True)
+        await ws.send(json.dumps({"command_type": "pivot-control-dashboard-apply", "payload": payload}))
+        ack = await ws_wait(ws, lambda m: m.get("event_type") in ("pivot-control-dashboard-apply", "validation-errors"), 25.0)
+        result: dict[str, Any] = {"pivot": p["name"], "applied": True, "changed": diff, "ack": ack}
+        if ack and ack.get("event_type") == "validation-errors":
+            result["applied"] = False
+            result["error"] = ack.get("payload")
+        try:
+            fresh = await live_status(ws, eid, timeout=8.0)
+            result["now"] = _describe(fresh)
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+    finally:
+        await ws.close()
+
+
+if MCP_WRITE_TOKEN:
+
+    @mcp.tool()
+    async def pivot_control_preview(pivot: str, ctx: Context) -> dict[str, Any]:
+        """Show a pivot's current control settings (direction, water, speed %, depth, circle hours, service stop, plan, toggles)."""
+        _require_write(ctx)
+        p = await resolve_pivot(pivot)
+        ws = await ws_session()
+        try:
+            st = await live_status(ws, p["id"])
+        finally:
+            await ws.close()
+        return {"pivot": p["name"], "current": _describe(st)}
+
+    @mcp.tool()
+    async def start_pivot(pivot: str, direction: str, water_on: bool = True, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Start a pivot moving 'forward' or 'reverse', with water on or off. Previews first; pass confirm=true to send."""
+        d = direction.strip().lower()
+        if d not in ("forward", "reverse"):
+            raise ValueError("direction must be 'forward' or 'reverse'")
+        return await _apply(ctx, pivot, {"direction_key": d, "water_on": bool(water_on)}, confirm)
+
+    @mcp.tool()
+    async def stop_pivot(pivot: str, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Stop a pivot (direction 'stopped'). Previews first; pass confirm=true to send."""
+        return await _apply(ctx, pivot, {"direction_key": "stopped"}, confirm)
+
+    @mcp.tool()
+    async def set_water(pivot: str, on: bool, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Turn water on or off without changing direction. Previews first; pass confirm=true to send."""
+        return await _apply(ctx, pivot, {"water_on": bool(on)}, confirm)
+
+    @mcp.tool()
+    async def set_speed(pivot: str, speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
+                        confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Set pivot speed by ONE of: speed_pct (1-100), depth_in (inches per pass), or hours (time per full circle). Previews first; confirm=true to send."""
+        return await _apply(ctx, pivot, {}, confirm, speed_pct=speed_pct, depth_in=depth_in, hours=hours)
+
+    @mcp.tool()
+    async def set_service_stop(pivot: str, angle_deg: float | None, repeat: bool | None = None, confirm: bool = False,
+                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Set (or clear with angle_deg=null) the service stop angle; optionally set repeat. Previews first; confirm=true to send."""
+        ch: dict[str, Any] = {"service_stop_angle": None if angle_deg is None else float(angle_deg) % 360}
+        if repeat is not None:
+            ch["service_stop_repeat_on"] = bool(repeat)
+        return await _apply(ctx, pivot, ch, confirm)
+
+    @mcp.tool()
+    async def select_plan(pivot: str, plan: str, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Select a saved plan by name, or 'manual' for Manual Mode. Previews first; confirm=true to send."""
+        return await _apply(ctx, pivot, {}, confirm, plan=plan)
+
+    @mcp.tool()
+    async def set_toggles(pivot: str, auto_reverse: bool | None = None, auto_restart: bool | None = None,
+                          accessory_1: bool | None = None, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Turn auto-reverse, auto-restart and/or accessory 1 on or off. Previews first; confirm=true to send."""
+        ch: dict[str, Any] = {}
+        if auto_reverse is not None:
+            ch["auto_reverse_on"] = bool(auto_reverse)
+        if auto_restart is not None:
+            ch["auto_restart_on"] = bool(auto_restart)
+        if accessory_1 is not None:
+            ch["aux_1_on"] = bool(accessory_1)
+        if not ch:
+            raise ValueError("Give at least one of auto_reverse, auto_restart, accessory_1.")
+        return await _apply(ctx, pivot, ch, confirm)
+
+    @mcp.tool()
+    async def list_plans(pivot: str, ctx: Context) -> list[dict[str, Any]]:
+        """List the saved plans on a pivot (names you can pass to select_plan)."""
+        _require_write(ctx)
+        p = await resolve_pivot(pivot)
+        plans = await api_get(f"/irrigation-controllers/{p['id']}/plans") or []
+        if isinstance(plans, dict):
+            plans = plans.get("items", [])
+        return [{"name": x.get("name"), "type": x.get("plan_type"), "id": x.get("id")} for x in plans]
+
+
+# ---------------------------------------------------------------------------
 # HTTP app with bearer-token gate
 # ---------------------------------------------------------------------------
 
@@ -525,7 +814,8 @@ class BearerAuth(BaseHTTPMiddleware):
             or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
             or request.query_params.get("key", "")
         )
-        if not MCP_AUTH_TOKEN or presented != MCP_AUTH_TOKEN:
+        valid = {k for k in (MCP_AUTH_TOKEN, MCP_WRITE_TOKEN) if k}
+        if not valid or presented not in valid:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
 

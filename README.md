@@ -56,6 +56,34 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 | `irrigation_overview` | Hours / acres / volume / depth per pivot over a range |
 | `pivot_history` | Raw controller telemetry for the last N hours |
 
+## Optional: control tools (read & write)
+
+Off by default. To enable, add a second environment variable in Render,
+`MCP_WRITE_TOKEN` (use Render's Generate button), and redeploy. Then add a
+**second** connector in Claude, e.g. "FieldNET Control", with the same URL but
+`X-API-Key` = the write key. Keep the read-only connector for everyone else.
+
+| Tool | Does |
+| --- | --- |
+| `pivot_control_preview` | Current control settings for a pivot |
+| `start_pivot` | Run forward or reverse, water on/off |
+| `stop_pivot` | Stop |
+| `set_water` | Water on/off without changing direction |
+| `set_speed` | By percent, inches per pass, or hours per circle (one of the three) |
+| `set_service_stop` | Set or clear the service-stop angle, optional repeat |
+| `select_plan` | Pick a saved plan by name, or `manual` |
+| `set_toggles` | Auto-reverse, auto-restart, accessory 1 |
+| `list_plans` | Names of the saved plans on a pivot |
+
+Safety: every control tool returns a preview of the current state and the
+exact change, and sends nothing until called again with `confirm=true`. A
+connector holding only the read key gets "read access only" from these tools.
+Every applied command is logged in Render's Logs as `CONTROL <time> <pivot> <diff>`.
+Commands are sent exactly the way the web app's dashboard sends them
+(`pivot-control-dashboard-apply` over the WebSocket) and the server waits for
+the acknowledgement. Endgun enable/disable is not included (it lives in the
+endgun tables, a different flow).
+
 ## Notes
 
 - FieldNET access tokens last 10 minutes; the server refreshes them
