@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -297,6 +298,9 @@ mcp = FastMCP(
     ),
     stateless_http=True,
     json_response=True,
+    # The SDK's DNS-rebinding guard only trusts localhost Host headers by default,
+    # which returns 421 to any public hostname. The API key gates access instead.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
