@@ -825,6 +825,12 @@ async def health(_: Request):
 
 
 app = mcp.streamable_http_app()
+# Second URL for the same MCP endpoint, so a separate "FieldNET Control"
+# connector can be added in Claude (it won't accept two connectors with the
+# same URL). Access is still decided by which key the connector sends.
+from starlette.routing import Route as _Route  # noqa: E402
+_mcp_route = next(r for r in app.routes if getattr(r, "path", None) == mcp.settings.streamable_http_path)
+app.router.routes.append(_Route("/control/mcp", endpoint=_mcp_route.endpoint, methods=list(_mcp_route.methods or [])))
 app.add_route("/", health, methods=["GET"])
 app.add_route("/health", health, methods=["GET"])
 app.add_middleware(BearerAuth)

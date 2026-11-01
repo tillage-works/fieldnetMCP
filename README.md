@@ -60,7 +60,9 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 
 Off by default. To enable, add a second environment variable in Render,
 `MCP_WRITE_TOKEN` (use Render's Generate button), and redeploy. Then add a
-**second** connector in Claude, e.g. "FieldNET Control", with the same URL but
+**second** connector in Claude, e.g. "FieldNET Control", with the URL
+`https://<your-service>.onrender.com/control/mcp` (Claude won't accept two
+connectors with the same URL; both paths serve the same server) and
 `X-API-Key` = the write key. Keep the read-only connector for everyone else.
 
 | Tool | Does |
