@@ -68,17 +68,21 @@ connectors with the same URL; both paths serve the same server) and
 | Tool | Does |
 | --- | --- |
 | `pivot_control_preview` | Current control settings for a pivot |
-| `start_pivot` | Run forward or reverse, water on/off |
-| `stop_pivot` | Stop |
-| `set_water` | Water on/off without changing direction |
-| `set_speed` | By percent, inches per pass, or hours per circle (one of the three) |
-| `set_service_stop` | Set or clear the service-stop angle, optional repeat |
-| `select_plan` | Pick a saved plan by name, or `manual` |
-| `set_toggles` | Auto-reverse, auto-restart, accessory 1 |
+| `pivot_control` | Everything in one command: direction (forward/reverse/stopped), water on/off, speed (percent, inches per pass, or hours per circle), service stop (set/clear, repeat), plan, auto-reverse, auto-restart, accessory 1 |
+| `stop_pivot` | Stop, leaving the other settings alone |
 | `list_plans` | Names of the saved plans on a pivot |
 
-Safety: every control tool returns a preview of the current state and the
-exact change, and sends nothing until called again with `confirm=true`. A
+FieldNET's Apply sends the whole control panel at once, so all the changes for
+a pivot go in a single `pivot_control` call and are applied together. Settings
+you don't mention are kept, except direction: if you don't give one, the pivot
+keeps doing what it's actually doing, so a stopped or faulted pivot stays
+stopped. (FieldNET keeps reporting the last commanded direction after a fault;
+re-sending that stale value would restart the pivot.)
+
+Safety: every control call returns a preview (current state, exact change, and
+what the pivot will do) plus a `preview_token`, and sends nothing until called
+again with `confirm=true` and that token. If the pivot's state changed in
+between, the token no longer matches and you get a fresh preview instead. A
 connector holding only the read key gets "read access only" from these tools.
 Every applied command is logged in Render's Logs as `CONTROL <time> <pivot> <diff>`.
 Commands are sent exactly the way the web app's dashboard sends them

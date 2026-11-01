@@ -24,6 +24,7 @@ Only GET endpoints are used. Nothing here can start, stop, or change a pivot.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 import time
@@ -320,9 +321,11 @@ mcp = FastMCP(
         "Read-only access to Lindsay FieldNET pivot data for this farm. Pivots are named like "
         "M-31, W-2, R-12. Angles are degrees clockwise from north (0 = north). Depths are inches, "
         "pressure psi, speed percent of full. Dates are YYYY-MM-DD in America/Los_Angeles. "
-        + ("Control tools (start/stop/speed/service stop/plan/toggles) are available to connectors "
-           "that hold the write key; each one previews the change and only sends it when called "
-           "again with confirm=true. Always show the user the preview and get a clear yes before confirming."
+        + ("Connectors holding the write key can control pivots with pivot_control (and stop_pivot). "
+           "FieldNET applies the whole control panel at once, so put ALL requested changes for a pivot "
+           "in ONE pivot_control call; never split them across calls. Each call previews first and "
+           "only sends when repeated with confirm=true and the preview_token. Always show the user "
+           "the preview (including 'pivot_will') and get a clear yes before confirming."
            if MCP_WRITE_TOKEN else "Nothing here can control equipment.")
     ),
     stateless_http=True,
@@ -653,9 +656,37 @@ async def _plan_id_for(equipment_id: str, plan: str | None) -> str | None:
     raise ValueError(f"No plan named '{plan}' on this pivot. Plans: {names or '(none)'}")
 
 
+MOVING_PREFIXES = ("forward", "reverse")
+
+
+def _effective_direction(status: dict[str, Any]) -> str:
+    """The direction the pivot is actually doing right now.
+
+    FieldNET keeps reporting the last commanded direction_key after a fault or
+    shutdown (e.g. 'forward' while in low-pressure-shutdown). Re-sending that
+    stale value restarts the pivot, so anything not visibly moving counts as
+    'stopped'."""
+    op = (status.get("operational_status") or "").lower()
+    d = (status.get("direction_key") or "").lower()
+    if op.startswith(MOVING_PREFIXES) and d in MOVING_PREFIXES:
+        return d
+    return "stopped"
+
+
+def _payload_token(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:10]
+
+
 async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confirm: bool,
+                 preview_token: str | None = None,
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
                  plan: str | None = None) -> dict[str, Any]:
+    """Build ONE complete control-panel payload and (on confirm) send it once.
+
+    FieldNET applies the whole panel at once, so every field is sent every
+    time. Fields not given are carried over from the live state, except
+    direction, which defaults to what the pivot is actually doing (stopped
+    unless it is visibly moving)."""
     _require_write(ctx)
     p = await resolve_pivot(pivot)
     eid = p["id"]
@@ -667,9 +698,10 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             changes["plan_id"] = await _plan_id_for(eid, plan)
         if rate is not None:
             changes["rate"] = rate
+        eff_dir = _effective_direction(status)
         payload = {
             "equipment_id": eid,
-            "direction_key": status.get("direction_key"),
+            "direction_key": eff_dir,
             "plan_id": status.get("current_plan_id"),
             "aux_1_on": status.get("accessory_1_on"),
             "chem_stop": status.get("chem_stop"),
@@ -680,7 +712,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             "water_on": status.get("water_on"),
             "rate": status.get("rate"),
         }
-        before = _describe(status)
+        before = _describe(dict(status, direction_key=eff_dir))
         payload.update(changes)
         after_status = dict(status, **{
             "direction_key": payload["direction_key"], "water_on": payload["water_on"], "rate": payload["rate"],
@@ -691,17 +723,30 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
         after = _describe(after_status)
         diff = {k: {"from": before[k], "to": after[k]} for k in after if before.get(k) != after.get(k)
                 and k not in ("status", "angle_deg", "rtu_online")}
+        token = _payload_token(payload)
+        will_move = payload["direction_key"] in MOVING_PREFIXES
+        summary = {
+            "pivot_will": (f"RUN {payload['direction_key'].upper()}, water {'ON' if payload['water_on'] else 'OFF'}"
+                           if will_move else "BE STOPPED"),
+            "final_settings": after,
+        }
         if not status.get("rtu_online"):
             return {"pivot": p["name"], "applied": False, "error": "RTU is offline; command would not be delivered.", "current": before}
-        if not confirm:
-            return {"pivot": p["name"], "applied": False, "preview": True, "current": before,
-                    "would_change": diff, "next_step": "Call again with confirm=true to send this to the pivot."}
+        if not confirm or preview_token != token:
+            out = {"pivot": p["name"], "applied": False, "preview": True, "current": before,
+                   "would_change": diff, **summary, "preview_token": token,
+                   "next_step": "Show this to the user. If they approve, call again with the same arguments, "
+                                "confirm=true and this preview_token. Everything is sent in one apply."}
+            if confirm and preview_token != token:
+                out["note"] = ("Not sent: no preview_token, or the pivot's state changed since the preview. "
+                               "This is a fresh preview; confirm again with its token.")
+            return out
         if not diff:
             return {"pivot": p["name"], "applied": False, "note": "No change from current state.", "current": before}
         print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} {json.dumps(diff)}", flush=True)
         await ws.send(json.dumps({"command_type": "pivot-control-dashboard-apply", "payload": payload}))
         ack = await ws_wait(ws, lambda m: m.get("event_type") in ("pivot-control-dashboard-apply", "validation-errors"), 25.0)
-        result: dict[str, Any] = {"pivot": p["name"], "applied": True, "changed": diff, "ack": ack}
+        result: dict[str, Any] = {"pivot": p["name"], "applied": True, "changed": diff, **summary, "ack": ack}
         if ack and ack.get("event_type") == "validation-errors":
             result["applied"] = False
             result["error"] = ack.get("payload")
@@ -727,64 +772,77 @@ if MCP_WRITE_TOKEN:
             st = await live_status(ws, p["id"])
         finally:
             await ws.close()
-        return {"pivot": p["name"], "current": _describe(st)}
+        cur = _describe(dict(st, direction_key=_effective_direction(st)))
+        cur["last_commanded_direction"] = st.get("direction_key")
+        return {"pivot": p["name"], "current": cur}
 
     @mcp.tool()
-    async def start_pivot(pivot: str, direction: str, water_on: bool = True, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Start a pivot moving 'forward' or 'reverse', with water on or off. Previews first; pass confirm=true to send."""
-        d = direction.strip().lower()
-        if d not in ("forward", "reverse"):
-            raise ValueError("direction must be 'forward' or 'reverse'")
-        return await _apply(ctx, pivot, {"direction_key": d, "water_on": bool(water_on)}, confirm)
+    async def pivot_control(pivot: str,
+                            direction: str | None = None,
+                            water_on: bool | None = None,
+                            speed_pct: float | None = None,
+                            depth_in: float | None = None,
+                            hours: float | None = None,
+                            service_stop_deg: float | None = None,
+                            clear_service_stop: bool = False,
+                            service_stop_repeat: bool | None = None,
+                            plan: str | None = None,
+                            auto_reverse: bool | None = None,
+                            auto_restart: bool | None = None,
+                            accessory_1: bool | None = None,
+                            confirm: bool = False,
+                            preview_token: str | None = None,
+                            ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Set ALL desired pivot controls in ONE command, like the FieldNET control panel's Apply.
 
-    @mcp.tool()
-    async def stop_pivot(pivot: str, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Stop a pivot (direction 'stopped'). Previews first; pass confirm=true to send."""
-        return await _apply(ctx, pivot, {"direction_key": "stopped"}, confirm)
-
-    @mcp.tool()
-    async def set_water(pivot: str, on: bool, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Turn water on or off without changing direction. Previews first; pass confirm=true to send."""
-        return await _apply(ctx, pivot, {"water_on": bool(on)}, confirm)
-
-    @mcp.tool()
-    async def set_speed(pivot: str, speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
-                        confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Set pivot speed by ONE of: speed_pct (1-100), depth_in (inches per pass), or hours (time per full circle). Previews first; confirm=true to send."""
-        return await _apply(ctx, pivot, {}, confirm, speed_pct=speed_pct, depth_in=depth_in, hours=hours)
-
-    @mcp.tool()
-    async def set_service_stop(pivot: str, angle_deg: float | None, repeat: bool | None = None, confirm: bool = False,
-                               ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Set (or clear with angle_deg=null) the service stop angle; optionally set repeat. Previews first; confirm=true to send."""
-        ch: dict[str, Any] = {"service_stop_angle": None if angle_deg is None else float(angle_deg) % 360}
-        if repeat is not None:
-            ch["service_stop_repeat_on"] = bool(repeat)
-        return await _apply(ctx, pivot, ch, confirm)
-
-    @mcp.tool()
-    async def select_plan(pivot: str, plan: str, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Select a saved plan by name, or 'manual' for Manual Mode. Previews first; confirm=true to send."""
-        return await _apply(ctx, pivot, {}, confirm, plan=plan)
-
-    @mcp.tool()
-    async def set_toggles(pivot: str, auto_reverse: bool | None = None, auto_restart: bool | None = None,
-                          accessory_1: bool | None = None, confirm: bool = False, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
-        """Turn auto-reverse, auto-restart and/or accessory 1 on or off. Previews first; confirm=true to send."""
+        Put every change in a single call (e.g. direction='reverse', water_on=false,
+        speed_pct=90, service_stop_deg=260). Never split changes across calls:
+        FieldNET applies the whole panel each time.
+        - direction: 'forward', 'reverse' or 'stopped'. If omitted, the pivot keeps
+          doing what it is doing now (a stopped or faulted pivot stays stopped).
+        - speed: give ONE of speed_pct (1-100), depth_in (inches per pass) or hours (per circle).
+        - service_stop_deg sets the stop angle; clear_service_stop=true removes it.
+        - plan: saved plan name, or 'manual'.
+        Unspecified settings are kept. First call returns a preview and a
+        preview_token; after the user approves, call again with the same
+        arguments plus confirm=true and that preview_token."""
         ch: dict[str, Any] = {}
+        if direction is not None:
+            d = direction.strip().lower()
+            if d not in DIRECTION_KEYS:
+                raise ValueError("direction must be 'forward', 'reverse' or 'stopped'")
+            ch["direction_key"] = d
+        if water_on is not None:
+            ch["water_on"] = bool(water_on)
+        if clear_service_stop and service_stop_deg is not None:
+            raise ValueError("Give service_stop_deg or clear_service_stop, not both.")
+        if clear_service_stop:
+            ch["service_stop_angle"] = None
+        elif service_stop_deg is not None:
+            ch["service_stop_angle"] = float(service_stop_deg) % 360
+        if service_stop_repeat is not None:
+            ch["service_stop_repeat_on"] = bool(service_stop_repeat)
         if auto_reverse is not None:
             ch["auto_reverse_on"] = bool(auto_reverse)
         if auto_restart is not None:
             ch["auto_restart_on"] = bool(auto_restart)
         if accessory_1 is not None:
             ch["aux_1_on"] = bool(accessory_1)
-        if not ch:
-            raise ValueError("Give at least one of auto_reverse, auto_restart, accessory_1.")
-        return await _apply(ctx, pivot, ch, confirm)
+        if not ch and plan is None and all(v is None for v in (speed_pct, depth_in, hours)):
+            raise ValueError("No changes given.")
+        return await _apply(ctx, pivot, ch, confirm, preview_token,
+                            speed_pct=speed_pct, depth_in=depth_in, hours=hours, plan=plan)
+
+    @mcp.tool()
+    async def stop_pivot(pivot: str, confirm: bool = False, preview_token: str | None = None,
+                         ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Stop a pivot (direction 'stopped'), leaving other settings as they are. Previews first;
+        confirm=true with the preview_token to send."""
+        return await _apply(ctx, pivot, {"direction_key": "stopped"}, confirm, preview_token)
 
     @mcp.tool()
     async def list_plans(pivot: str, ctx: Context) -> list[dict[str, Any]]:
-        """List the saved plans on a pivot (names you can pass to select_plan)."""
+        """List the saved plans on a pivot (names you can pass to pivot_control's plan)."""
         _require_write(ctx)
         p = await resolve_pivot(pivot)
         plans = await api_get(f"/irrigation-controllers/{p['id']}/plans") or []
