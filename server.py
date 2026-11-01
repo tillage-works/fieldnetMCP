@@ -18,7 +18,8 @@ FIELDNET_TZ              optional  IANA timezone for date ranges (default Americ
 FIELDNET_CLIENT_ID       optional  defaults to the NextGen web app's public client id
 PORT                     optional  Render sets this automatically
 
-Only GET endpoints are used. Nothing here can start, stop, or change a pivot.
+Only GET endpoints are used, unless MCP_WRITE_TOKEN (control tools) or the pump
+group watcher (WATCHER_ENABLED, see watcher.py) is switched on.
 """
 
 from __future__ import annotations
@@ -734,14 +735,19 @@ def _payload_token(payload: dict[str, Any]) -> str:
 async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confirm: bool,
                  preview_token: str | None = None, poll: bool = True,
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
-                 plan: str | None = None) -> dict[str, Any]:
+                 plan: str | None = None, internal: bool = False) -> dict[str, Any]:
     """Build ONE complete control-panel payload and (on confirm) send it once.
 
     FieldNET applies the whole panel at once, so every field is sent every
     time. Fields not given are carried over from the live state, except
     direction, which defaults to what the pivot is actually doing (stopped
-    unless it is visibly moving)."""
-    _require_write(ctx)
+    unless it is visibly moving).
+
+    internal=True is ONLY for the pump group watcher (watcher.py): it skips the
+    connector key check and the human preview step, because a person already
+    approved these exact settings when they set the group live."""
+    if not internal:
+        _require_write(ctx)
     p = await resolve_pivot(pivot)
     eid = p["id"]
     ws = await ws_session()
@@ -788,7 +794,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
         }
         if not status.get("rtu_online"):
             return {"pivot": p["name"], "applied": False, "error": "RTU is offline; command would not be delivered.", "current": before}
-        if not confirm or preview_token != token:
+        if not internal and (not confirm or preview_token != token):
             out = {"pivot": p["name"], "applied": False, "preview": True, "current": before,
                    "would_change": diff, **summary, "preview_token": token,
                    "next_step": "Show this to the user. If they approve, call again with the same arguments, "
@@ -799,7 +805,8 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             return out
         if not diff:
             return {"pivot": p["name"], "applied": False, "note": "No change from current state.", "current": before}
-        print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} {json.dumps(diff)}", flush=True)
+        print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} "
+              f"{'[watcher] ' if internal else ''}{json.dumps(diff)}", flush=True)
         await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": APPLY_TOPIC}))
         await ws.send(json.dumps({"command_type": APPLY_TOPIC, "payload": payload}))
         ack = await ws_command_status(ws, eid, "apply-event", APPLY_TOPIC, 45.0)
@@ -916,6 +923,28 @@ if MCP_WRITE_TOKEN:
 
 
 # ---------------------------------------------------------------------------
+# Pump group fallback watcher (off unless WATCHER_ENABLED=1; see watcher.py)
+# ---------------------------------------------------------------------------
+
+import contextlib  # noqa: E402
+
+import watcher as _watcher  # noqa: E402
+
+
+async def _watcher_pivots() -> list[dict[str, Any]]:
+    return await get_pivots(max_age_s=30)
+
+
+async def _watcher_start(m: "_watcher.Member") -> dict[str, Any]:
+    """Start a fallback pivot with the settings saved for it: direction, water on, speed or depth."""
+    return await _apply(None, m.pivot_id, {"direction_key": m.direction, "water_on": True}, confirm=True,
+                        speed_pct=m.speed_pct, depth_in=m.depth_in, internal=True)
+
+
+WATCHER = _watcher.from_env(_watcher_pivots, _watcher_start, TZ)
+
+
+# ---------------------------------------------------------------------------
 # HTTP app with bearer-token gate
 # ---------------------------------------------------------------------------
 
@@ -956,6 +985,20 @@ app.router.routes.append(_Route("/control/mcp", endpoint=_mcp_route.endpoint, me
 app.add_route("/", health, methods=["GET"])
 app.add_route("/health", health, methods=["GET"])
 app.add_middleware(BearerAuth)
+
+if WATCHER:
+    _mcp_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(a):  # type: ignore[no-untyped-def]
+        async with _mcp_lifespan(a) as state:
+            task = asyncio.create_task(WATCHER.run_forever())
+            try:
+                yield state
+            finally:
+                task.cancel()
+
+    app.router.lifespan_context = _lifespan
 
 
 if __name__ == "__main__":
