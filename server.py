@@ -936,8 +936,12 @@ async def _watcher_pivots() -> list[dict[str, Any]]:
 
 
 async def _watcher_start(m: "_watcher.Member") -> dict[str, Any]:
-    """Start a fallback pivot with the settings saved for it: direction, water on, speed or depth."""
-    return await _apply(None, m.pivot_id, {"direction_key": m.direction, "water_on": True}, confirm=True,
+    """Start a fallback pivot with the settings saved for it: direction, water on, speed or depth,
+    and auto reverse when one is chosen (otherwise the panel's setting is kept)."""
+    changes: dict[str, Any] = {"direction_key": m.direction, "water_on": True}
+    if m.auto_reverse is not None:
+        changes["auto_reverse_on"] = bool(m.auto_reverse)
+    return await _apply(None, m.pivot_id, changes, confirm=True,
                         speed_pct=m.speed_pct, depth_in=m.depth_in, internal=True)
 
 

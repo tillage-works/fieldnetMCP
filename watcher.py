@@ -67,6 +67,7 @@ class Member:
     direction: str | None = None  # 'forward' | 'reverse' (fallbacks)
     speed_pct: float | None = None
     depth_in: float | None = None
+    auto_reverse: bool | None = None  # fallbacks: True/False sets it on start; None keeps the panel's setting
 
 
 @dataclass
@@ -193,7 +194,8 @@ def window_key(group: Group, now: datetime) -> str | None:
 
 def describe_settings(m: Member) -> str:
     speed = f"{m.speed_pct:g}% speed" if m.speed_pct is not None else f'{m.depth_in:g}" depth'
-    return f"{m.direction}, water on, {speed}"
+    ar = "" if m.auto_reverse is None else f", auto reverse {'on' if m.auto_reverse else 'off'}"
+    return f"{m.direction}, water on, {speed}{ar}"
 
 
 REASON_TEXT = {"fault": "shut down", "low-pressure": "shut down on low pressure", "finished": "finished its run"}
@@ -295,15 +297,18 @@ class Watcher:
         ids = [g["id"] for g in groups]
         wins = await db.fetch("SELECT group_id, start_dow, start_min, end_dow, end_min FROM pumpgroups.pump_group_window "
                               "WHERE group_id = ANY($1::int[])", ids)
-        mems = await db.fetch("SELECT group_id, pivot_id, pivot_name, role, fallback_order, direction, speed_pct, depth_in "
-                              "FROM pumpgroups.pump_group_pivot WHERE group_id = ANY($1::int[])", ids)
+        # auto_reverse is read through to_jsonb so this works before the column is added.
+        mems = await db.fetch("SELECT group_id, pivot_id, pivot_name, role, fallback_order, direction, speed_pct, depth_in, "
+                              "(to_jsonb(p) ->> 'auto_reverse')::boolean AS auto_reverse "
+                              "FROM pumpgroups.pump_group_pivot p WHERE group_id = ANY($1::int[])", ids)
         out = []
         for g in groups:
             out.append(Group(
                 id=g["id"], name=g["name"], mode=g["mode"],
                 windows=[(w["start_dow"], w["start_min"], w["end_dow"], w["end_min"]) for w in wins if w["group_id"] == g["id"]],
                 members=[Member(m["pivot_id"], m["pivot_name"], m["role"], m["fallback_order"], m["direction"],
-                                _r(m["speed_pct"], 1), _r(m["depth_in"], 2)) for m in mems if m["group_id"] == g["id"]],
+                                _r(m["speed_pct"], 1), _r(m["depth_in"], 2), m["auto_reverse"])
+                         for m in mems if m["group_id"] == g["id"]],
             ))
         return out
 
