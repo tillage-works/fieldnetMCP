@@ -49,7 +49,7 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 | Tool | What it answers |
 | --- | --- |
 | `list_pivots` | Every pivot with status, direction, angle, speed %, depth in, psi, water on |
-| `pivot_status` | One pivot's current state |
+| `pivot_status` | One pivot's current state; `poll=true` asks the panel for a fresh report first (the app's Poll button) |
 | `pivot_track` | Position/pressure samples over a range, grouped into wet runs (where laps started/stopped) |
 | `applied_irrigation` | Depth applied per wedge of the circle (the Applied Irrigation map as numbers) |
 | `daily_report` | Hours run and acres per day |
@@ -89,6 +89,16 @@ Commands are sent exactly the way the web app's dashboard sends them
 (`pivot-control-dashboard-apply` over the WebSocket) and the server waits for
 the acknowledgement. Endgun enable/disable is not included (it lives in the
 endgun tables, a different flow).
+
+## Fresh readings (polling)
+
+FieldNET only updates a pivot's position and status when the panel reports in,
+so a plain status check can be minutes old. `pivot_status(poll=true)` sends
+`pivot-control-dashboard-poll` (the same thing the app's Poll button does) and
+waits for the panel's reply before reading. The control tools always poll
+before previewing and before sending, and wait for the panel's own
+acknowledgement of an apply (`panel_ack`: successful, failure, or
+waiting-for-online-status when the panel is offline).
 
 ## Notes
 

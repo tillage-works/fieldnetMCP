@@ -355,10 +355,18 @@ async def list_pivots(status: str | None = None, watering_only: bool = False) ->
 
 
 @mcp.tool()
-async def pivot_status(pivot: str) -> dict[str, Any]:
-    """Current state of one pivot by name (e.g. 'W-2'): status, direction, angle, speed, depth, psi, service stop."""
+async def pivot_status(pivot: str, poll: bool = False) -> dict[str, Any]:
+    """Current state of one pivot by name (e.g. 'W-2'): status, direction, angle, speed, depth, psi, service stop.
+
+    FieldNET only refreshes a pivot's position and status when the panel reports
+    in, so the cached reading can be minutes old. poll=true asks the panel for a
+    fresh report first (like the Poll/refresh button in the app; takes ~5-45 s).
+    Use it whenever the current angle or status matters."""
     p = await resolve_pivot(pivot)
-    fresh = await get_pivots(max_age_s=30)
+    poll_result = None
+    if poll:
+        poll_result = await poll_pivot(p["id"])
+    fresh = await get_pivots(max_age_s=0 if poll else 30)
     p = next((x for x in fresh if x["id"] == p["id"]), p)
     out = summarize_pivot(p)
     out["lat"] = p.get("latitude")
@@ -366,6 +374,8 @@ async def pivot_status(pivot: str) -> dict[str, Any]:
     out["depth_at_full_speed_in"] = p.get("application_depth_at_full_speed")
     out["auto_reverse"] = p.get("is_auto_reverse_on")
     out["auto_restart"] = p.get("is_auto_restart_on")
+    if poll_result is not None:
+        out["poll"] = poll_result
     return out
 
 
@@ -598,6 +608,50 @@ async def live_status(ws, equipment_id: str, timeout: float = 10.0) -> dict[str,
     return msg["payload"]
 
 
+POLL_TOPIC = "pivot-control-dashboard-poll"
+APPLY_TOPIC = "pivot-control-dashboard-apply"
+FINAL_CMD_STATES = ("successful", "failure", "waiting-for-online-status")
+
+
+async def ws_command_status(ws, equipment_id: str, kind: str, topic: str, timeout: float) -> dict[str, Any] | None:
+    """Wait for the final status of a poll/apply command.
+
+    FieldNET reports progress as {event_type: 'poll-event'|'apply-event',
+    payload: {equipment_id, event_type: <topic>, status, progress}} with status
+    in-progress -> successful / failure / waiting-for-online-status."""
+    last: dict[str, Any] | None = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = await ws_wait(ws, lambda m: m.get("event_type") == kind
+                            and (m.get("payload") or {}).get("equipment_id") == equipment_id
+                            and (m.get("payload") or {}).get("event_type") == topic,
+                            max(0.1, deadline - time.time()))
+        if not msg:
+            break
+        last = msg["payload"]
+        if (last.get("status") or "") in FINAL_CMD_STATES:
+            return last
+    return last
+
+
+async def ws_poll(ws, equipment_id: str, timeout: float = 45.0) -> dict[str, Any]:
+    """Ask the panel for a fresh report (the app's Poll button)."""
+    await ws.send(json.dumps({"command_type": "subscribe", "id": equipment_id, "event_type": POLL_TOPIC}))
+    await ws.send(json.dumps({"command_type": POLL_TOPIC, "payload": {"equipment_id": equipment_id}}))
+    st = await ws_command_status(ws, equipment_id, "poll-event", POLL_TOPIC, timeout)
+    status = (st or {}).get("status") or "no-response"
+    return {"status": status, "fresh": status == "successful",
+            "at": datetime.now(TZ).isoformat(timespec="seconds")}
+
+
+async def poll_pivot(equipment_id: str, timeout: float = 45.0) -> dict[str, Any]:
+    ws = await ws_session()
+    try:
+        return await ws_poll(ws, equipment_id, timeout)
+    finally:
+        await ws.close()
+
+
 def _rate_from(status: dict[str, Any], speed_pct: float | None, depth_in: float | None, hours: float | None) -> float | None:
     given = [v is not None for v in (speed_pct, depth_in, hours)]
     if sum(given) == 0:
@@ -678,7 +732,7 @@ def _payload_token(payload: dict[str, Any]) -> str:
 
 
 async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confirm: bool,
-                 preview_token: str | None = None,
+                 preview_token: str | None = None, poll: bool = True,
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
                  plan: str | None = None) -> dict[str, Any]:
     """Build ONE complete control-panel payload and (on confirm) send it once.
@@ -692,6 +746,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
     eid = p["id"]
     ws = await ws_session()
     try:
+        poll_result = await ws_poll(ws, eid) if poll else None
         status = await live_status(ws, eid)
         rate = _rate_from(status, speed_pct, depth_in, hours)
         if plan is not None:
@@ -726,6 +781,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
         token = _payload_token(payload)
         will_move = payload["direction_key"] in MOVING_PREFIXES
         summary = {
+            "poll": poll_result,
             "pivot_will": (f"RUN {payload['direction_key'].upper()}, water {'ON' if payload['water_on'] else 'OFF'}"
                            if will_move else "BE STOPPED"),
             "final_settings": after,
@@ -744,12 +800,18 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
         if not diff:
             return {"pivot": p["name"], "applied": False, "note": "No change from current state.", "current": before}
         print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} {json.dumps(diff)}", flush=True)
-        await ws.send(json.dumps({"command_type": "pivot-control-dashboard-apply", "payload": payload}))
-        ack = await ws_wait(ws, lambda m: m.get("event_type") in ("pivot-control-dashboard-apply", "validation-errors"), 25.0)
-        result: dict[str, Any] = {"pivot": p["name"], "applied": True, "changed": diff, **summary, "ack": ack}
-        if ack and ack.get("event_type") == "validation-errors":
-            result["applied"] = False
-            result["error"] = ack.get("payload")
+        await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": APPLY_TOPIC}))
+        await ws.send(json.dumps({"command_type": APPLY_TOPIC, "payload": payload}))
+        ack = await ws_command_status(ws, eid, "apply-event", APPLY_TOPIC, 45.0)
+        ack_status = (ack or {}).get("status") or "no-response"
+        result: dict[str, Any] = {"pivot": p["name"], "applied": ack_status == "successful",
+                                  "sent": True, "panel_ack": ack_status, "changed": diff, **summary}
+        if ack_status == "failure":
+            result["error"] = "The panel reported the apply FAILED."
+        elif ack_status == "waiting-for-online-status":
+            result["note"] = "Queued: the panel is offline; FieldNET will deliver it when it reconnects."
+        elif ack_status != "successful":
+            result["note"] = "Sent, but no final acknowledgement from the panel within 45 s; check status with poll=true."
         try:
             fresh = await live_status(ws, eid, timeout=8.0)
             result["now"] = _describe(fresh)
@@ -763,18 +825,20 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
 if MCP_WRITE_TOKEN:
 
     @mcp.tool()
-    async def pivot_control_preview(pivot: str, ctx: Context) -> dict[str, Any]:
-        """Show a pivot's current control settings (direction, water, speed %, depth, circle hours, service stop, plan, toggles)."""
+    async def pivot_control_preview(pivot: str, ctx: Context, poll: bool = True) -> dict[str, Any]:
+        """Show a pivot's current control settings (direction, water, speed %, depth, circle hours, service stop, plan, toggles).
+        Polls the panel first for a fresh reading unless poll=false."""
         _require_write(ctx)
         p = await resolve_pivot(pivot)
         ws = await ws_session()
         try:
+            poll_result = await ws_poll(ws, p["id"]) if poll else None
             st = await live_status(ws, p["id"])
         finally:
             await ws.close()
         cur = _describe(dict(st, direction_key=_effective_direction(st)))
         cur["last_commanded_direction"] = st.get("direction_key")
-        return {"pivot": p["name"], "current": cur}
+        return {"pivot": p["name"], "poll": poll_result, "current": cur}
 
     @mcp.tool()
     async def pivot_control(pivot: str,
