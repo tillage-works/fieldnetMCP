@@ -147,6 +147,13 @@ def test_windows():
     assert window_key(weekend, t("2026-11-09T07:00")) is None
 
 
+def test_auto_reverse_in_settings_text():
+    from watcher import describe_settings
+    assert describe_settings(Member("F", "W-5", "fallback", 1, "forward", 50.0, None)) == "forward, water on, 50% speed"
+    assert describe_settings(Member("F", "W-5", "fallback", 1, "reverse", None, 0.5, True)) == 'reverse, water on, 0.5" depth, auto reverse on'
+    assert describe_settings(Member("F", "W-5", "fallback", 1, "forward", 40.0, None, False)).endswith("auto reverse off")
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):
