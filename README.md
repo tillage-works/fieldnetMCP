@@ -122,3 +122,31 @@ curl -H "X-API-Key: anything" -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' localhost:8000/mcp
 ```
+
+## Optional: pump group watcher (automatic fallback pivots)
+
+Off by default. For farms using the Hyer Farms dashboard's **Pump groups** page:
+pivots fed by the same water are grouped, and during a group's schedule (e.g.
+overnight, or a weekend) this server checks them every 3 minutes. When a
+*scheduled* pivot that was watering shuts down on a fault or finishes its run,
+it starts the group's next *fallback* pivot with the direction and speed/depth
+saved for it. The rules are at the top of [`watcher.py`](watcher.py); the
+decisions are tested in `test_watcher.py` (`python test_watcher.py`).
+
+| Variable | |
+| --- | --- |
+| `WATCHER_ENABLED` | `1` to run the watcher |
+| `PUMPGROUPS_DB_URL` | the `pumpgroups_rw` URL from the dashboard's `npm run create-pumpgroups-db` |
+| `WATCHER_ALLOW_LIVE` | `1` lets groups set to *Live* start pivots. Unset: every group is practice (logs only) |
+| `PUMPGROUPS_NOTIFY_URL` | `https://<dashboard>/api/v1/pump-groups/notify`, so alerts become push notifications |
+| `PUMPGROUPS_NOTIFY_SECRET` | same value as on the dashboard |
+| `WATCHER_INTERVAL_S` | seconds between checks (default 180, minimum 60) |
+
+- It needs an **always-on** Render plan: free services sleep after 15 minutes
+  without requests, and a sleeping service watches nothing.
+- Outside every group's schedule it makes no FieldNET calls.
+- It starts pivots without the preview/confirm step the Claude control tools
+  use, because a person already chose the exact settings when they set the
+  group live. Every command is logged (`CONTROL … [watcher]`), and every
+  decision goes to the dashboard's activity log.
+- It never stops a pivot, and doesn't need `MCP_WRITE_TOKEN`.
