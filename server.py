@@ -437,20 +437,20 @@ async def applied_irrigation(pivot: str, from_date: str | None = None, to_date: 
 
 
 @mcp.tool()
-async def plan_even_up(pivot: str, max_depth_per_pass_in: float, from_date: str | None = None, to_date: str | None = None,
-                       target_in: float | None = None, tolerance_in: float = 0.05, forward_is_clockwise: bool = True,
-                       restart_minutes: float = 10.0, poll: bool = False) -> dict[str, Any]:
+async def plan_even_up(pivot: str, max_depth_per_pass_in: float = _programs.DEFAULT_MAX_DEPTH_IN,
+                       from_date: str | None = None, to_date: str | None = None,
+                       target_in: float | None = None, tolerance_in: float = 0.05,
+                       restart_minutes: float = 5.0, poll: bool = False) -> dict[str, Any]:
     """PLAN ONLY (sends nothing): how to even up the water applied around a pivot's circle.
 
     Reads the Applied Irrigation wedges for a date range, the pivot's position and FieldNET's
     depth/circle-time calibration, and proposes position-based steps: direction, water on/off,
     depth per pass, and the angle each step ends at (use it as the service stop), with how long
     each takes, the clock time it should finish, and the depth every wedge ends up with.
-    - max_depth_per_pass_in: the most the ground takes in one pass right now (the field's
-      intake limit, e.g. 0.35 in the fall). Ask the user for it; don't guess.
+    - max_depth_per_pass_in: the most the ground takes in one pass right now (the intake limit).
+      It changes with soil, season and conditions, so ask the user each time; 0.3 if they don't say.
     - from_date/to_date: the applied-water range to even up (default: last 30 days).
     - target_in: depth to bring every wedge to (default: the wettest wedge).
-    - forward_is_clockwise: does 'forward' increase the angle on this pivot? (default yes; confirm per pivot)
     - poll=true asks the panel for a fresh position first (~5-45 s).
     Shortfalls under half a pass at 100% speed can't be helped without overwatering; the notes say so."""
     p = await resolve_pivot(pivot)
@@ -479,8 +479,7 @@ async def plan_even_up(pivot: str, max_depth_per_pass_in: float, from_date: str 
         water_on=bool(p.get("is_water_on")) and moving,
     )
     profile = _programs.FieldProfile(depth_full_in=rcf * IN_PER_M, circle_hours_full=frt / 3600.0,
-                                     max_depth_in=max_depth_per_pass_in, forward_clockwise=forward_is_clockwise,
-                                     restart_minutes=restart_minutes)
+                                     max_depth_in=max_depth_per_pass_in, restart_minutes=restart_minutes)
     # Plan on the exact millimetre figures FieldNET reports, not the rounded inches.
     wedges = [_programs.Wedge(w["from_deg"], w["to_deg"], (w["depth_mm"] / MM_PER_IN) if w.get("depth_mm") is not None
                               else (w["depth_in"] or 0.0)) for w in raw]
@@ -493,8 +492,6 @@ async def plan_even_up(pivot: str, max_depth_per_pass_in: float, from_date: str 
     if plan["steps"]:
         plan["finish_by"] = plan["steps"][-1]["done_by"]
     plan["notes"].append("FieldNET reports applied depth in whole millimetres, so every wedge figure is ±0.02\".")
-    if forward_is_clockwise:
-        plan["notes"].append("Assumes 'forward' increases the angle on this pivot; confirm before running.")
     return {
         "pivot": p.get("name"),
         "applied_from": start.isoformat(),

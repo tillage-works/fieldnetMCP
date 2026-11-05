@@ -175,18 +175,20 @@ def test_stopped_pivot_has_no_turn_round_penalty():
     assert not any("Turning round" in n for n in plan["notes"]) and plan["total_hours"] < 3
 
 
-def test_counter_clockwise_forward():
-    """On a pivot where forward DEcreases the angle, the same ground gives mirrored direction names."""
-    ccw = FieldProfile(depth_full_in=0.14, circle_hours_full=10.0, max_depth_in=0.35, forward_clockwise=False)
-    wedges = [Wedge(0, 90, 2.6), Wedge(90, 0, 3.0)]
-    plan = plan_even_up(wedges, PivotState(100, "reverse", 0.2, True), ccw)  # reverse = clockwise here
-    # The dry ground is 10° away anticlockwise (= forward on this pivot) but 260° on clockwise.
-    assert steps_summary(plan) == [
-        ("forward", False, None, 100.0, 90.0, "flying"),
-        ("forward", True, 0.35, 90.0, 0.0, "end"),
-    ], steps_summary(plan)
-    assert any("Turning round first" in n for n in plan["notes"])
-    assert_invariants(plan, ccw)
+def test_reverse_is_anticlockwise():
+    """Forward is clockwise on every pivot, so going round anticlockwise is reverse."""
+    wedges = [Wedge(60, 95, 2.7), Wedge(95, 60, 3.0)]
+    plan = plan_even_up(wedges, PivotState(100, "reverse", 0.2, True), FLAT)
+    assert steps_summary(plan)[0][:2] == ("reverse", False) and plan["steps"][0]["end_deg"] == 95.0
+    assert not any("Turning round" in n for n in plan["notes"])  # already going the quick way
+    assert_invariants(plan, FLAT)
+
+
+def test_intake_limit_defaults_to_0_3():
+    profile = FieldProfile(depth_full_in=0.14, circle_hours_full=10.0)
+    assert profile.max_depth_in == 0.3
+    plan = plan_even_up([Wedge(0, 180, 2.5), Wedge(180, 0, 3.0)], PivotState(0, "forward", 0.2, True), profile)
+    assert max(s["depth_in"] or 0 for s in plan["steps"]) <= 0.3
 
 
 # ── invariants over random fields ───────────────────────────────────────────

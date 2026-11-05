@@ -30,8 +30,9 @@ The plan, from where the pivot is now:
   Both starting directions are tried; the quicker plan wins, and turning
   round straight away pays a stop-and-restart allowance.
 
-Angles are degrees clockwise from north. Which way "forward" turns is a per-
-pivot setting (FieldProfile.forward_clockwise).
+Angles are degrees clockwise from north. Forward is clockwise (increasing
+angle) on every Hyer Farms pivot; reverse is anticlockwise. Speed and water
+can always change on the fly; only a reversal needs a stop.
 """
 
 from __future__ import annotations
@@ -41,6 +42,10 @@ from dataclasses import dataclass
 from typing import Any
 
 EPS = 1e-6
+
+# The most one pass may put on when nobody says otherwise. The real limit
+# changes with soil, season and conditions, so it's asked for every plan.
+DEFAULT_MAX_DEPTH_IN = 0.30
 
 # ---------------------------------------------------------------------------
 # Angles. Every arc and crossing check goes through these, so wrap-around
@@ -98,9 +103,8 @@ class Wedge:
 class FieldProfile:
     depth_full_in: float  # inches per pass at 100% speed: the lightest wet pass there is
     circle_hours_full: float  # hours per circle at 100% speed
-    max_depth_in: float  # intake limit: the most one pass may put on
-    forward_clockwise: bool = True  # does "forward" increase the angle on this pivot?
-    restart_minutes: float = 10.0  # allowance for each stop and restart (a reversal)
+    max_depth_in: float = DEFAULT_MAX_DEPTH_IN  # intake limit: the most one pass may put on
+    restart_minutes: float = 5.0  # allowance for each stop and restart (a reversal); restarts aren't costly
 
 
 @dataclass
@@ -208,16 +212,15 @@ def _build(segs: list[_Seg], at: float, clockwise: bool, work: list[int], profil
     """Turn one starting direction into steps, times and what each segment gets."""
     for s in segs:
         s.added = 0.0
-    fwd_is_cw = profile.forward_clockwise
     crossed = [0] * len(segs)
     steps: list[dict[str, Any]] = []
     moving_dir = state.direction if state.direction in ("forward", "reverse") else None
-    cur_cw = None if moving_dir is None else ((moving_dir == "forward") == fwd_is_cw)
+    cur_cw = None if moving_dir is None else moving_dir == "forward"  # forward = clockwise
 
     passes = _crossings(segs, at, clockwise, work)
     for pi, (sign, idxs) in enumerate(passes):
         goes_cw = clockwise if sign > 0 else not clockwise
-        direction = "forward" if goes_cw == fwd_is_cw else "reverse"
+        direction = "forward" if goes_cw else "reverse"
         groups: list[dict[str, Any]] = []  # consecutive segments sharing one command
         for i in idxs:
             s = segs[i]
@@ -359,8 +362,8 @@ def plan_even_up(wedges: list[Wedge], state: PivotState, profile: FieldProfile, 
 
     # Try both starting directions; turning round straight away costs a restart.
     cur = state.direction if state.direction in ("forward", "reverse") else None
-    cur_cw = None if cur is None else ((cur == "forward") == profile.forward_clockwise)
-    options = [cur_cw] if cur_cw is not None else [profile.forward_clockwise]
+    cur_cw = None if cur is None else cur == "forward"  # forward = clockwise
+    options = [cur_cw] if cur_cw is not None else [True]
     options.append(not options[0])
     best = None
     for clockwise in options:
@@ -395,4 +398,4 @@ def plan_even_up(wedges: list[Wedge], state: PivotState, profile: FieldProfile, 
             "spread_after_in": round(hi1 - lo1, 2), "wedges": wedge_table(added), "notes": notes}
 
 
-__all__ = ["Wedge", "FieldProfile", "PivotState", "plan_even_up", "norm", "cw", "arc_contains", "degrees_to_go", "has_passed"]
+__all__ = ["Wedge", "FieldProfile", "PivotState", "plan_even_up", "DEFAULT_MAX_DEPTH_IN", "norm", "cw", "arc_contains", "degrees_to_go", "has_passed"]

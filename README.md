@@ -62,7 +62,8 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 `plan_even_up` answers "this circle got uneven water: what do I run to even it up?" from
 the Applied Irrigation map, the pivot's position, FieldNET's own depth and circle-time
 calibration, and the most the ground takes in one pass right now (`max_depth_per_pass_in`,
-which the planner never exceeds; ask for it rather than guessing).
+which the planner never exceeds). The intake limit changes with soil, season and
+conditions, so it's asked for every plan, with **0.3"** as the default.
 
 - **Why a shutoff point can't fix it:** at a constant speed every pass puts the same depth
   everywhere. Evening up needs a different depth by sector, or extra passes over only the dry
@@ -71,7 +72,9 @@ which the planner never exceeds; ask for it rather than guessing).
   crossed once, each at its own depth per pass, dry-running at 100% over ground that needs
   none. Then shuttle back and forth over only what still needs more, each pass shorter than
   the last. Both starting directions are tried; turning round straight away pays a
-  stop-and-restart allowance (`restart_minutes`).
+  stop-and-restart allowance (`restart_minutes`, default 5: restarts aren't costly).
+- **Directions:** forward is clockwise (increasing angle) on every pivot; reverse is
+  anticlockwise. Speed and water change on the fly; only a reversal stops the pivot.
 - **Per step:** direction, water, depth (and the speed that means), the angle it ends at (use
   it as the service stop), hours, and the clock time it should finish. `flying` steps change
   speed without stopping; `stop` steps end at a reversal.
