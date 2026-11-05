@@ -1054,6 +1054,59 @@ async def health(_: Request):
     return PlainTextResponse("fieldnet-mcp ok")
 
 
+async def api_plan_even_up(request: Request):
+    """POST /api/plan-even-up: the plan_even_up tool over plain HTTP, for the Hyer Farms dashboard's
+    preview. Plan only, sends nothing. Needs the read (or write) key like every other route.
+
+    Body: {"pivot": name or id, "max_depth_per_pass_in"?: 0.3, "from_date"?, "to_date"?,
+           "target_in"?, "tolerance_in"?: 0.05, "poll"?: false}
+    → 200 the plan · 400 bad input · 422 the planner refused (reason in "error") · 502 FieldNET trouble"""
+    try:
+        b = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "Send a JSON body."}, status_code=400)
+    if not isinstance(b, dict) or not isinstance(b.get("pivot"), str) or not b["pivot"].strip():
+        return JSONResponse({"error": "pivot (name or id) is required."}, status_code=400)
+
+    def num(key: str, default: float | None, lo: float, hi: float) -> float | None:
+        v = b.get(key, default)
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= float(v) <= hi):
+            raise ValueError(f"{key} must be a number from {lo:g} to {hi:g}.")
+        return float(v)
+
+    def day(key: str) -> str | None:
+        v = b.get(key)
+        if v is None:
+            return None
+        try:
+            date.fromisoformat(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a date like 2026-09-24.") from None
+        return v
+
+    try:
+        args = {
+            "max_depth_per_pass_in": num("max_depth_per_pass_in", _programs.DEFAULT_MAX_DEPTH_IN, 0.05, 2.0),
+            "target_in": num("target_in", None, 0.0, 100.0),
+            "tolerance_in": num("tolerance_in", 0.05, 0.01, 0.5),
+            "from_date": day("from_date"),
+            "to_date": day("to_date"),
+            "poll": bool(b.get("poll", False)),
+        }
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    try:
+        plan = await plan_even_up(b["pivot"].strip(), **args)
+    except ValueError as e:  # unknown pivot, partial circle, impossible limit, …
+        return JSONResponse({"error": str(e)}, status_code=422)
+    except Exception as e:  # noqa: BLE001
+        print(f"PLAN error {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't read FieldNET right now. Try again in a minute."}, status_code=502)
+    return JSONResponse(plan)
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1063,6 +1116,7 @@ _mcp_route = next(r for r in app.routes if getattr(r, "path", None) == mcp.setti
 app.router.routes.append(_Route("/control/mcp", endpoint=_mcp_route.endpoint, methods=list(_mcp_route.methods or [])))
 app.add_route("/", health, methods=["GET"])
 app.add_route("/health", health, methods=["GET"])
+app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
 app.add_middleware(BearerAuth)
 
 if WATCHER:

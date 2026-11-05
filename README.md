@@ -83,9 +83,14 @@ conditions, so it's asked for every plan, with **0.3"** as the default.
   round; FieldNET's applied depths are whole millimetres (±0.02").
 - **Not supported yet:** partial circles and barricades (it refuses), park zones.
 
+The Hyer Farms dashboard gets the same plans over HTTP: `POST /api/plan-even-up` with the
+read key (`X-API-Key`) and a JSON body of the same parameters (`pivot` = name or id). It
+returns the same result, 400 for bad input, 422 when the planner refuses (with the reason),
+and 502 if FieldNET can't be reached.
+
 The logic is pure and lives in `programs.py` (no FieldNET, no database); `python test_programs.py`
 runs its tests, including the real W-26 case from Nov 2026 and the safety rules over 400
-random fields.
+random fields; `python test_api.py` (with the requirements installed) tests the endpoint.
 
 ## Optional: control tools (read & write)
 
