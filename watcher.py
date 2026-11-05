@@ -201,8 +201,12 @@ def describe_settings(m: Member) -> str:
 REASON_TEXT = {"fault": "shut down", "low-pressure": "shut down on low pressure", "finished": "finished its run"}
 
 
-def decide(group: Group, state: WindowState, pivots: list[dict[str, Any]], now_s: float) -> tuple[list[Event], list[Start]]:
-    """One check of one group inside an active window. Mutates `state`; returns events and starts."""
+def decide(group: Group, state: WindowState, pivots: list[dict[str, Any]], now_s: float,
+           mid_program: set[str] | frozenset[str] = frozenset()) -> tuple[list[Event], list[Start]]:
+    """One check of one group inside an active window. Mutates `state`; returns events and starts.
+
+    mid_program: pivots whose live irrigation program is between steps (engine.py). Their
+    service stops are the program turning round, not the end of a run, so they start nothing."""
     events: list[Event] = []
     starts: list[Start] = []
     by_id = {str(p.get("id")): p for p in pivots}
@@ -232,6 +236,10 @@ def decide(group: Group, state: WindowState, pivots: list[dict[str, Any]], now_s
         if prev is None or prev == cur:
             continue
         reason = trigger_for(prev, cur)
+        if reason == "finished" and pid in mid_program:
+            events.append(Event("no-trigger", f"{name} stopped at a service stop its irrigation program set; "
+                                "the program carries on, so no fallback started.", pivot=name))
+            continue
         if not reason:
             if prev == "running-wet" and cur in ("stopped", "offline") and pid not in state.noted_stop:
                 state.noted_stop.add(pid)
@@ -331,6 +339,20 @@ class Watcher:
         print(f"PUMPGROUP {datetime.now(self.tz).isoformat(timespec='seconds')} "
               f"{'[practice] ' if practice else ''}{group.name if group else '-'}: {ev.kind}: {ev.message}", flush=True)
 
+    async def mid_program(self) -> set[str]:
+        """Pivots whose live irrigation program is between steps (see decide). Empty before the
+        programs tables exist."""
+        db = await self.pool()
+        try:
+            rows = await db.fetch("SELECT r.pivot_id FROM pumpgroups.program_run r JOIN pumpgroups.program p "
+                                  "ON p.id = r.program_id WHERE r.ended_at IS NULL AND NOT r.practice "
+                                  "AND p.state = 'running' AND r.step < jsonb_array_length(r.plan -> 'steps') - 1")
+        except Exception as e:  # noqa: BLE001 - e.g. UndefinedTableError before create-pumpgroups-db is re-run
+            if "does not exist" not in str(e):
+                raise
+            return set()
+        return {r["pivot_id"] for r in rows}
+
     async def heartbeat(self, error: str | None, active: list[str]) -> None:
         db = await self.pool()
         await db.execute("INSERT INTO pumpgroups.watcher (id, last_check_at, last_error, active_groups, allow_live) "
@@ -359,10 +381,11 @@ class Watcher:
             return
 
         pivots = await self.get_pivots()
+        mid_program = await self.mid_program()
         alerts = False
         for g, st in active:
             practice = g.mode != "live" or not self.allow_live
-            events, starts = decide(g, st, pivots, time.time())
+            events, starts = decide(g, st, pivots, time.time(), mid_program)
             for ev in events:
                 await self.log(g, ev, practice)
                 alerts |= ev.alert

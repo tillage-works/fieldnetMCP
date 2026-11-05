@@ -30,7 +30,7 @@ import math
 import os
 import time
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import json
@@ -810,7 +810,8 @@ def _payload_token(payload: dict[str, Any]) -> str:
 async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confirm: bool,
                  preview_token: str | None = None, poll: bool = True,
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
-                 plan: str | None = None, internal: bool = False) -> dict[str, Any]:
+                 plan: str | None = None, internal: bool = False, send: bool = True,
+                 verify: "Callable[[dict[str, Any]], str | None] | None" = None) -> dict[str, Any]:
     """Build ONE complete control-panel payload and (on confirm) send it once.
 
     FieldNET applies the whole panel at once, so every field is sent every
@@ -818,9 +819,12 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
     direction, which defaults to what the pivot is actually doing (stopped
     unless it is visibly moving).
 
-    internal=True is ONLY for the pump group watcher (watcher.py): it skips the
-    connector key check and the human preview step, because a person already
-    approved these exact settings when they set the group live."""
+    internal=True is ONLY for the pump group watcher (watcher.py) and the program
+    engine (engine.py): it skips the connector key check and the human preview
+    step, because a person already approved these settings when they set the
+    group live or armed the program. send=False builds and checks everything but
+    sends nothing (practice). verify(final_settings) returns a reason when what
+    FieldNET would apply doesn't match what was meant; then nothing is sent."""
     if not internal:
         _require_write(ctx)
     p = await resolve_pivot(pivot)
@@ -869,6 +873,14 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
         }
         if not status.get("rtu_online"):
             return {"pivot": p["name"], "applied": False, "error": "RTU is offline; command would not be delivered.", "current": before}
+        if verify is not None:
+            mismatch = verify(after)
+            if mismatch:
+                return {"pivot": p["name"], "applied": False, "mismatch": mismatch, "current": before,
+                        "would_change": diff, **summary}
+        if internal and not send:
+            return {"pivot": p["name"], "applied": False, "preview": True, "current": before,
+                    "would_change": diff, **summary}
         if not internal and (not confirm or preview_token != token):
             out = {"pivot": p["name"], "applied": False, "preview": True, "current": before,
                    "would_change": diff, **summary, "preview_token": token,
@@ -879,7 +891,8 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
                                "This is a fresh preview; confirm again with its token.")
             return out
         if not diff:
-            return {"pivot": p["name"], "applied": False, "note": "No change from current state.", "current": before}
+            return {"pivot": p["name"], "applied": False, "no_change": True, "note": "No change from current state.",
+                    "current": before, **summary}
         print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} "
               f"{'[watcher] ' if internal else ''}{json.dumps(diff)}", flush=True)
         await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": APPLY_TOPIC}))
@@ -1024,6 +1037,60 @@ WATCHER = _watcher.from_env(_watcher_pivots, _watcher_start, TZ)
 
 
 # ---------------------------------------------------------------------------
+# Irrigation program engine (off unless PROGRAMS_ENABLED=1; see engine.py)
+# ---------------------------------------------------------------------------
+
+import engine as _engine  # noqa: E402
+
+
+async def _engine_observe(pivot_id: str, poll: bool) -> dict[str, Any]:
+    """The pivot's live status, after asking the panel for a fresh report when poll=True."""
+    ws = await ws_session()
+    try:
+        fresh = bool((await ws_poll(ws, pivot_id)).get("fresh")) if poll else False
+        return {**await live_status(ws, pivot_id), "_fresh": fresh}
+    finally:
+        await ws.close()
+
+
+async def _engine_plan(pivot_id: str, s: dict[str, Any]) -> dict[str, Any]:
+    """Work an even-up out again at start, with the settings the owner chose, up to today."""
+    return await plan_even_up(pivot_id, max_depth_per_pass_in=float(s["maxDepthIn"]), from_date=s.get("fromDate"),
+                              to_date=None, target_in=s.get("targetIn"), tolerance_in=float(s.get("toleranceIn") or 0.05),
+                              poll=True)
+
+
+async def _engine_control(pivot_id: str, cmd: dict[str, Any], send: bool,
+                          verify: Callable[[dict[str, Any]], str | None]) -> dict[str, Any]:
+    """One full-panel command for a program step: direction, water, depth (or 100% for a dry step),
+    the step's end as a one-time service stop, and manual mode (a saved plan would fight the depth)."""
+    changes: dict[str, Any] = {"direction_key": cmd["direction"], "water_on": bool(cmd["water_on"])}
+    if cmd.get("service_stop_deg") is not None:
+        changes["service_stop_angle"] = float(cmd["service_stop_deg"]) % 360
+        changes["service_stop_repeat_on"] = False
+    if cmd["direction"] != "stopped":
+        changes["plan_id"] = None
+    return await _apply(None, pivot_id, changes, confirm=True, poll=False, speed_pct=cmd.get("speed_pct"),
+                        depth_in=cmd.get("depth_in"), internal=True, send=send, verify=verify)
+
+
+async def _engine_notify() -> None:
+    """Nudge the dashboard to push unsent alerts (the same hook the pump group watcher uses)."""
+    url = os.environ.get("PUMPGROUPS_NOTIFY_URL", "")
+    if not url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=90) as c:
+            await c.post(url, headers={"X-Pumpgroups-Secret": os.environ.get("PUMPGROUPS_NOTIFY_SECRET", "")})
+    except Exception as e:  # noqa: BLE001
+        print(f"PROGRAM notify failed: {e}", flush=True)
+
+
+ENGINE = _engine.from_env(os.environ.get("PUMPGROUPS_DB_URL", ""), TZ, _watcher_pivots, _engine_observe,
+                          _engine_plan, _engine_control, _engine_notify)
+
+
+# ---------------------------------------------------------------------------
 # HTTP app with bearer-token gate
 # ---------------------------------------------------------------------------
 
@@ -1119,17 +1186,18 @@ app.add_route("/health", health, methods=["GET"])
 app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
 app.add_middleware(BearerAuth)
 
-if WATCHER:
+if WATCHER or ENGINE:
     _mcp_lifespan = app.router.lifespan_context
 
     @contextlib.asynccontextmanager
     async def _lifespan(a):  # type: ignore[no-untyped-def]
         async with _mcp_lifespan(a) as state:
-            task = asyncio.create_task(WATCHER.run_forever())
+            tasks = [asyncio.create_task(x.run_forever()) for x in (WATCHER, ENGINE) if x]
             try:
                 yield state
             finally:
-                task.cancel()
+                for t in tasks:
+                    t.cancel()
 
     app.router.lifespan_context = _lifespan
 
