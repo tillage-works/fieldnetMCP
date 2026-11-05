@@ -52,9 +52,40 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 | `pivot_status` | One pivot's current state; `poll=true` asks the panel for a fresh report first (the app's Poll button) |
 | `pivot_track` | Position/pressure samples over a range, grouped into wet runs (where laps started/stopped) |
 | `applied_irrigation` | Depth applied per wedge of the circle (the Applied Irrigation map as numbers) |
+| `plan_even_up` | **Plan only, sends nothing.** How to even up the applied water: position-based steps (direction, water, depth per pass, stop angle) within the field's intake limit, with times and the depth each wedge ends up with. See *Even-up planner* below |
 | `daily_report` | Hours run and acres per day |
 | `irrigation_overview` | Hours / acres / volume / depth per pivot over a range |
 | `pivot_history` | Raw controller telemetry for the last N hours |
+
+## Even-up planner
+
+`plan_even_up` answers "this circle got uneven water: what do I run to even it up?" from
+the Applied Irrigation map, the pivot's position, FieldNET's own depth and circle-time
+calibration, and the most the ground takes in one pass right now (`max_depth_per_pass_in`,
+which the planner never exceeds). The intake limit changes with soil, season and
+conditions, so it's asked for every plan, with **0.3"** as the default.
+
+- **Why a shutoff point can't fix it:** at a constant speed every pass puts the same depth
+  everywhere. Evening up needs a different depth by sector, or extra passes over only the dry
+  arc by reversing.
+- **The plan:** carry on (or set off) one way until every wedge that needs water has been
+  crossed once, each at its own depth per pass, dry-running at 100% over ground that needs
+  none. Then shuttle back and forth over only what still needs more, each pass shorter than
+  the last. Both starting directions are tried; turning round straight away pays a
+  stop-and-restart allowance (`restart_minutes`, default 5: restarts aren't costly).
+- **Directions:** forward is clockwise (increasing angle) on every pivot; reverse is
+  anticlockwise. Speed and water change on the fly; only a reversal stops the pivot.
+- **Per step:** direction, water, depth (and the speed that means), the angle it ends at (use
+  it as the service stop), hours, and the clock time it should finish. `flying` steps change
+  speed without stopping; `stop` steps end at a reversal.
+- **Limits it reports instead of overwatering:** a shortfall under half a pass at 100% speed
+  can't be helped; slivers under 1% of the field right behind the pivot aren't worth a trip
+  round; FieldNET's applied depths are whole millimetres (±0.02").
+- **Not supported yet:** partial circles and barricades (it refuses), park zones.
+
+The logic is pure and lives in `programs.py` (no FieldNET, no database); `python test_programs.py`
+runs its tests, including the real W-26 case from Nov 2026 and the safety rules over 400
+random fields.
 
 ## Optional: control tools (read & write)
 

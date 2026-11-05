@@ -43,6 +43,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
+import programs as _programs
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -405,6 +407,12 @@ async def pivot_track(pivot: str, from_date: str | None = None, to_date: str | N
     }
 
 
+async def _applied_wedges(pivot_id: str, start: date, end: date) -> list[dict[str, Any]]:
+    s_iso, e_iso = _iso_bounds(start, end)
+    fc = await api_get(f"/irrigation-systems/{pivot_id}/applied-irrigation", {"from": s_iso, "to": e_iso, "use-season": "false"})
+    return wedges_from_geojson(fc or {})
+
+
 @mcp.tool()
 async def applied_irrigation(pivot: str, from_date: str | None = None, to_date: str | None = None) -> dict[str, Any]:
     """Water applied per wedge of the circle over a date range (the 'Applied Irrigation' map as numbers).
@@ -413,9 +421,7 @@ async def applied_irrigation(pivot: str, from_date: str | None = None, to_date: 
     """
     p = await resolve_pivot(pivot)
     start, end = _range(from_date, to_date, 7)
-    s_iso, e_iso = _iso_bounds(start, end)
-    fc = await api_get(f"/irrigation-systems/{p['id']}/applied-irrigation", {"from": s_iso, "to": e_iso, "use-season": "false"})
-    wedges = wedges_from_geojson(fc or {})
+    wedges = await _applied_wedges(p["id"], start, end)
     covered = sum(w["span_deg"] for w in wedges)
     avg = (sum(w["span_deg"] * (w["depth_in"] or 0) for w in wedges) / covered) if covered else 0
     return {
@@ -427,6 +433,75 @@ async def applied_irrigation(pivot: str, from_date: str | None = None, to_date: 
         "min_depth_in": min((w["depth_in"] or 0 for w in wedges), default=0),
         "max_depth_in": max((w["depth_in"] or 0 for w in wedges), default=0),
         "wedges": wedges,
+    }
+
+
+@mcp.tool()
+async def plan_even_up(pivot: str, max_depth_per_pass_in: float = _programs.DEFAULT_MAX_DEPTH_IN,
+                       from_date: str | None = None, to_date: str | None = None,
+                       target_in: float | None = None, tolerance_in: float = 0.05,
+                       restart_minutes: float = 5.0, poll: bool = False) -> dict[str, Any]:
+    """PLAN ONLY (sends nothing): how to even up the water applied around a pivot's circle.
+
+    Reads the Applied Irrigation wedges for a date range, the pivot's position and FieldNET's
+    depth/circle-time calibration, and proposes position-based steps: direction, water on/off,
+    depth per pass, and the angle each step ends at (use it as the service stop), with how long
+    each takes, the clock time it should finish, and the depth every wedge ends up with.
+    - max_depth_per_pass_in: the most the ground takes in one pass right now (the intake limit).
+      It changes with soil, season and conditions, so ask the user each time; 0.3 if they don't say.
+    - from_date/to_date: the applied-water range to even up (default: last 30 days).
+    - target_in: depth to bring every wedge to (default: the wettest wedge).
+    - poll=true asks the panel for a fresh position first (~5-45 s).
+    Shortfalls under half a pass at 100% speed can't be helped without overwatering; the notes say so."""
+    p = await resolve_pivot(pivot)
+    start, end = _range(from_date, to_date, 30)
+    raw = await _applied_wedges(p["id"], start, end)
+    if poll:
+        await poll_pivot(p["id"])
+    fresh = await get_pivots(max_age_s=0 if poll else 30)
+    p = next((x for x in fresh if x["id"] == p["id"]), p)
+    ws = await ws_session()
+    try:
+        live = await live_status(ws, p["id"])
+    finally:
+        await ws.close()
+    rcf, frt = live.get("rate_conversion_factor"), live.get("full_run_time")
+    if not rcf or not frt:
+        raise ValueError("FieldNET has no depth calibration or circle time for this pivot, so passes can't be timed.")
+
+    status = str(p.get("operational_status") or "").lower()
+    direction = str(p.get("direction") or "").lower()
+    moving = direction in MOVING_PREFIXES and status.startswith(MOVING_PREFIXES)
+    state = _programs.PivotState(
+        angle=float(p.get("pivot_angle") or 0.0),
+        direction=direction if moving else "stopped",
+        depth_in=mm_to_in(p.get("application_depth")) if moving else None,
+        water_on=bool(p.get("is_water_on")) and moving,
+    )
+    profile = _programs.FieldProfile(depth_full_in=rcf * IN_PER_M, circle_hours_full=frt / 3600.0,
+                                     max_depth_in=max_depth_per_pass_in, restart_minutes=restart_minutes)
+    # Plan on the exact millimetre figures FieldNET reports, not the rounded inches.
+    wedges = [_programs.Wedge(w["from_deg"], w["to_deg"], (w["depth_mm"] / MM_PER_IN) if w.get("depth_mm") is not None
+                              else (w["depth_in"] or 0.0)) for w in raw]
+    plan = _programs.plan_even_up(wedges, state, profile, target_in=target_in, tolerance_in=tolerance_in)
+
+    now = datetime.now(TZ)
+    for st in plan["steps"]:
+        st["service_stop_deg"] = st["end_deg"]
+        st["done_by"] = (now + timedelta(hours=st["done_after_hours"])).strftime("%a %-I:%M %p")
+    if plan["steps"]:
+        plan["finish_by"] = plan["steps"][-1]["done_by"]
+    plan["notes"].append("FieldNET reports applied depth in whole millimetres, so every wedge figure is ±0.02\".")
+    return {
+        "pivot": p.get("name"),
+        "applied_from": start.isoformat(),
+        "applied_to": end.isoformat(),
+        "position_as_of": p.get("last_updated"),
+        **plan,
+        "sent_nothing": True,
+        "to_run_by_hand": ("Each step is ONE pivot_control call with its direction, water_on, depth_in and "
+                           "service_stop_deg = the step's end angle, sent when the previous step reaches its end "
+                           "('flying': just before the angle, no stop; 'stop': after the service stop halts it)."),
     }
 
 
