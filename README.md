@@ -186,3 +186,66 @@ decisions are tested in `test_watcher.py` (`python test_watcher.py`).
   group live. Every command is logged (`CONTROL … [watcher]`), and every
   decision goes to the dashboard's activity log.
 - It never stops a pivot, and doesn't need `MCP_WRITE_TOKEN`.
+
+## Optional: irrigation program engine
+
+Off by default. Runs the programs armed on the Hyer Farms dashboard's **Programs**
+page: position-based steps (direction, water, depth per pass, and the angle each
+step ends at) that a field runs when it turns on. The first kind is the even-up
+from the planner above. The rules are at the top of [`engine.py`](engine.py); in
+short:
+
+- **When it starts.** A program starts when its field starts watering after it
+  was armed, or straight away if it was armed to *take over now*. An even-up is
+  worked out again at that moment from fresh applied-water data and the pivot's
+  position. If the fresh plan is much bigger than the one approved (more passes,
+  much longer, or a pass over the intake limit), it pauses for a new approval
+  instead of running.
+- **Service stop on every step.** Every step's command sets the panel's service
+  stop to that step's end angle. If this server goes down or misses a check, the
+  pivot stops there instead of running on.
+- **One command per change.** Each command carries every setting (direction,
+  water, depth or 100% for a dry step, service stop, manual mode). Before it is
+  sent, what FieldNET says it would apply is checked against the step; if they
+  differ, nothing is sent and the program pauses.
+- **Changes on the move and turn-rounds.** A speed or water change in the same
+  direction is sent just before its angle, from a fresh panel position. Missing
+  it is safe: the service stop holds the pivot and it restarts from there. A
+  turn-round waits for the service stop, then sends the next step.
+- **Manual stops win.** The engine only restarts a pivot that its own service
+  stop halted, at the angle it expected. Anything else pauses the program and
+  raises an alert, and a paused program never moves the pivot again:
+  - a stop by hand;
+  - a fault;
+  - settings changed by someone else;
+  - a pivot that runs past its service stop;
+  - a command that doesn't show up within 10 minutes;
+  - a run taking twice its planned time.
+- **Lost contact.** If the panel stops reporting, nothing is sent; the service
+  stop is the backstop.
+- **Pump groups.** Mid-program service stops don't count as "finished its run",
+  so they never start a pump group fallback; the last step's stop does.
+- **Practice.** Practice programs work everything out and check every command
+  with FieldNET, but send nothing.
+
+Positions are only as fresh as the panel's last report, so the engine estimates
+progress from the step's speed and asks the panel for a fresh position (the
+`poll` the tools use) every 30 minutes and as each change gets near. On W-26's
+33-hour even-up that's about 75 polls.
+
+| Variable | |
+| --- | --- |
+| `PROGRAMS_ENABLED` | `1` to run the engine |
+| `PUMPGROUPS_DB_URL` | the same `pumpgroups_rw` URL as the watcher (programs live in the `pumpgroups` schema) |
+| `PROGRAMS_ALLOW_LIVE` | `1` lets programs armed *Live* send commands. Unset: every program runs as practice |
+| `PUMPGROUPS_NOTIFY_URL` / `PUMPGROUPS_NOTIFY_SECRET` | as for the watcher: program alerts become push notifications too |
+| `PROGRAMS_INTERVAL_S` | seconds between checks while nothing is close (default 180, minimum 60) |
+
+- Like the watcher, it needs an **always-on** Render plan.
+- It doesn't need `MCP_WRITE_TOKEN`. Every command is logged (`CONTROL …`) and
+  every decision goes to the program's run log on the dashboard.
+- `python test_engine.py` runs whole programs against a simulated pivot. The pivot
+  moves at its commanded speed, stops at its service stop like a real panel, and
+  keeps track of the water it puts down. The tests cover a full W-26 run (it ends
+  3.65–3.70″), practice mode, manual stops, faults, overrides, losing contact
+  through a change, failed sends, overruns and a restart part-way through.
