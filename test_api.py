@@ -1,0 +1,123 @@
+"""Tests for the dashboard's plan endpoint (POST /api/plan-even-up).
+
+Needs the requirements installed (pip install -r requirements.txt). Run: python test_api.py
+FieldNET is replaced by W-26's real readings from Nov 5, so no network is used."""
+
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("FIELDNET_REFRESH_TOKEN", "test-refresh-token")
+os.environ["MCP_AUTH_TOKEN"] = "read-key"
+os.environ.pop("WATCHER_ENABLED", None)
+
+from starlette.testclient import TestClient  # noqa: E402
+
+import server  # noqa: E402
+
+W26 = {"id": "c6f28e12", "name": "W-26", "operational_status": "forward-wet", "communication_status": "online",
+       "direction": "forward", "pivot_angle": 63.3, "speed": 0.75, "application_depth": 0.19 * 25.4,
+       "is_water_on": True, "last_updated": "2026-11-05T15:02:00+00:00"}
+WEDGES = [{"from_deg": 61.4, "to_deg": 92.5, "span_deg": 31.1, "depth_in": 3.5, "depth_mm": 89},
+          {"from_deg": 92.5, "to_deg": 136.6, "span_deg": 44.1, "depth_in": 3.46, "depth_mm": 88},
+          {"from_deg": 136.6, "to_deg": 355.5, "span_deg": 218.9, "depth_in": 2.99, "depth_mm": 76},
+          {"from_deg": 355.5, "to_deg": 61.4, "span_deg": 65.9, "depth_in": 3.7, "depth_mm": 94}]
+
+
+class _WS:
+    async def close(self):
+        pass
+
+
+def fake_fieldnet(wedges=WEDGES, fail: Exception | None = None):
+    async def resolve(name):
+        if fail:
+            raise fail
+        if name not in ("W-26", W26["id"]):
+            raise ValueError(f"No pivot named '{name}'.")
+        return dict(W26)
+
+    async def applied(pid, start, end):
+        return wedges
+
+    async def pivots(max_age_s=60):
+        return [dict(W26)]
+
+    async def ws():
+        return _WS()
+
+    async def live(ws, eid, timeout=10.0):
+        return {"rate_conversion_factor": 0.1417 / server.IN_PER_M, "full_run_time": 10.05 * 3600}
+
+    server.resolve_pivot, server._applied_wedges, server.get_pivots = resolve, applied, pivots
+    server.ws_session, server.live_status = ws, live
+
+
+client = TestClient(server.app)
+KEY = {"X-API-Key": "read-key"}
+
+
+def test_needs_the_key():
+    fake_fieldnet()
+    assert client.post("/api/plan-even-up", json={"pivot": "W-26"}).status_code == 401
+    assert client.post("/api/plan-even-up", json={"pivot": "W-26"}, headers={"X-API-Key": "wrong"}).status_code == 401
+
+
+def test_w26_plan():
+    fake_fieldnet()
+    r = client.post("/api/plan-even-up", headers=KEY,
+                    json={"pivot": "W-26", "max_depth_per_pass_in": 0.35, "from_date": "2026-09-24", "to_date": "2026-11-04"})
+    assert r.status_code == 200, r.text
+    plan = r.json()
+    assert [(s["direction"], s["depth_in"], s["end_deg"], s["transition"]) for s in plan["steps"]] == [
+        ("forward", 0.19, 136.6, "flying"), ("forward", 0.35, 355.5, "stop"), ("reverse", 0.35, 136.6, "end")]
+    assert plan["sent_nothing"] is True and plan["applied_from"] == "2026-09-24"
+    assert all(s["service_stop_deg"] == s["end_deg"] for s in plan["steps"])
+
+
+def test_default_intake_limit_is_0_3():
+    fake_fieldnet()
+    plan = client.post("/api/plan-even-up", headers=KEY, json={"pivot": "W-26"}).json()
+    assert plan["max_depth_per_pass_in"] == 0.3
+    assert all((s["depth_in"] or 0) <= 0.3 for s in plan["steps"])
+
+
+def test_bad_input():
+    fake_fieldnet()
+    for body, fragment in [
+        ({}, "pivot"),
+        ({"pivot": "W-26", "max_depth_per_pass_in": "lots"}, "max_depth_per_pass_in"),
+        ({"pivot": "W-26", "max_depth_per_pass_in": 5}, "max_depth_per_pass_in"),
+        ({"pivot": "W-26", "tolerance_in": True}, "tolerance_in"),
+        ({"pivot": "W-26", "from_date": "last tuesday"}, "from_date must be a date"),
+        ({"pivot": "W-26", "to_date": 20261104}, "to_date must be a date"),
+    ]:
+        r = client.post("/api/plan-even-up", headers=KEY, json=body)
+        assert r.status_code == 400 and fragment in r.json()["error"], (body, r.text)
+    r = client.post("/api/plan-even-up", headers={**KEY, "Content-Type": "application/json"}, content=b"not json")
+    assert r.status_code == 400
+
+
+def test_planner_refusals_are_422():
+    fake_fieldnet(wedges=WEDGES[:2])  # only 21% of the circle
+    r = client.post("/api/plan-even-up", headers=KEY, json={"pivot": "W-26"})
+    assert r.status_code == 422 and "covers only" in r.json()["error"]
+    fake_fieldnet()
+    r = client.post("/api/plan-even-up", headers=KEY, json={"pivot": "W-99"})
+    assert r.status_code == 422 and "No pivot named" in r.json()["error"]
+
+
+def test_fieldnet_trouble_is_502():
+    fake_fieldnet(fail=TimeoutError("FieldNET slow"))
+    r = client.post("/api/plan-even-up", headers=KEY, json={"pivot": "W-26"})
+    assert r.status_code == 502 and "FieldNET" in r.json()["error"]
+
+
+if __name__ == "__main__":
+    n = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            n += 1
+            print(f"ok  {name}")
+    print(f"{n} passed")
