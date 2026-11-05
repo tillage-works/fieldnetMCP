@@ -811,7 +811,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
                  preview_token: str | None = None, poll: bool = True,
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
                  plan: str | None = None, internal: bool = False, send: bool = True,
-                 verify: "Callable[[dict[str, Any]], str | None] | None" = None) -> dict[str, Any]:
+                 verify: "Callable[[dict[str, Any]], str | None] | None" = None, who: str = "watcher") -> dict[str, Any]:
     """Build ONE complete control-panel payload and (on confirm) send it once.
 
     FieldNET applies the whole panel at once, so every field is sent every
@@ -894,7 +894,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             return {"pivot": p["name"], "applied": False, "no_change": True, "note": "No change from current state.",
                     "current": before, **summary}
         print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} "
-              f"{'[watcher] ' if internal else ''}{json.dumps(diff)}", flush=True)
+              f"{f'[{who}] ' if internal else ''}{json.dumps(diff)}", flush=True)
         await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": APPLY_TOPIC}))
         await ws.send(json.dumps({"command_type": APPLY_TOPIC, "payload": payload}))
         ack = await ws_command_status(ws, eid, "apply-event", APPLY_TOPIC, 45.0)
@@ -1062,16 +1062,16 @@ async def _engine_plan(pivot_id: str, s: dict[str, Any]) -> dict[str, Any]:
 
 async def _engine_control(pivot_id: str, cmd: dict[str, Any], send: bool,
                           verify: Callable[[dict[str, Any]], str | None]) -> dict[str, Any]:
-    """One full-panel command for a program step: direction, water, depth (or 100% for a dry step),
-    the step's end as a one-time service stop, and manual mode (a saved plan would fight the depth)."""
+    """One full-panel command for a program step: direction, water, depth (or 100% for a dry step) and
+    the step's end as a one-time service stop. The panel's plan is left as it is: FieldNET calls
+    manual mode "manual-mode", and a command that cleared it was accepted but never taken (W-26,
+    Nov 4). The engine checks the plan is manual before sending (engine.check_command)."""
     changes: dict[str, Any] = {"direction_key": cmd["direction"], "water_on": bool(cmd["water_on"])}
     if cmd.get("service_stop_deg") is not None:
         changes["service_stop_angle"] = float(cmd["service_stop_deg"]) % 360
         changes["service_stop_repeat_on"] = False
-    if cmd["direction"] != "stopped":
-        changes["plan_id"] = None
     return await _apply(None, pivot_id, changes, confirm=True, poll=False, speed_pct=cmd.get("speed_pct"),
-                        depth_in=cmd.get("depth_in"), internal=True, send=send, verify=verify)
+                        depth_in=cmd.get("depth_in"), internal=True, send=send, verify=verify, who="program")
 
 
 async def _engine_notify() -> None:

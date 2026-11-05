@@ -113,6 +113,29 @@ def test_fieldnet_trouble_is_502():
     assert r.status_code == 502 and "FieldNET" in r.json()["error"]
 
 
+def test_program_commands_leave_the_plan_alone():
+    """W-26, Nov 4 2026: a command that cleared the panel's "manual-mode" plan was acknowledged but
+    never taken. Program step commands must not touch the plan."""
+    import asyncio
+
+    seen = {}
+
+    async def fake_apply(ctx, pivot, changes, confirm, **kw):
+        seen.update(changes=changes, kw=kw)
+        return {"applied": True}
+
+    real = server._apply
+    server._apply = fake_apply
+    try:
+        cmd = {"direction": "forward", "water_on": True, "depth_in": 0.35, "speed_pct": None, "service_stop_deg": 355.5}
+        asyncio.run(server._engine_control("W-26", cmd, True, lambda after: None))
+    finally:
+        server._apply = real
+    assert "plan_id" not in seen["changes"], seen
+    assert seen["changes"]["service_stop_angle"] == 355.5 and seen["changes"]["service_stop_repeat_on"] is False
+    assert seen["kw"]["depth_in"] == 0.35 and seen["kw"]["who"] == "program" and seen["kw"]["internal"] is True
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):

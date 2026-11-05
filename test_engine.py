@@ -39,7 +39,8 @@ class Sim:
         self.water = water
         self.rate = D_FULL / depth
         self.service_stop: float | None = None
-        self.plan_id = None
+        self.plan_id = "manual-mode"  # how FieldNET reports manual mode
+        self.ignored: list[dict[str, Any]] = []  # commands the panel accepted but never took
         self.status = f"{direction}-{'wet' if water else 'dry'}" if direction != "stopped" else "stopped"
         self.online = True
         self.status_at = self.t - 3600
@@ -106,6 +107,10 @@ class Sim:
                 self.applied[i % self.BINS] += self.depth() * cover / 0.1
 
     def _apply(self, c: dict[str, Any]) -> None:
+        if c.get("plan_id") is None and self.plan_id is not None:
+            # W-26, Nov 4 2026: a command that cleared "manual-mode" was acknowledged but never taken.
+            self.ignored.append(c)
+            return
         self.direction_key = c["direction_key"]
         self.water = c["water_on"]
         self.rate = c["rate"]
@@ -163,7 +168,7 @@ class Sim:
             rate = cmd["speed_pct"] / 100
         payload = {"direction_key": cmd["direction"], "water_on": cmd["water_on"], "rate": rate,
                    "service_stop_angle": cmd.get("service_stop_deg", self.service_stop),
-                   "plan_id": None if cmd["direction"] != "stopped" else self.plan_id}
+                   "plan_id": self.plan_id}
         after = {"direction_key": payload["direction_key"], "water_on": payload["water_on"],
                  "speed_pct": round(rate * 100, 1), "depth_in": round(D_FULL / rate, 2),
                  "service_stop_deg": payload["service_stop_angle"], "plan_id": payload["plan_id"]}
@@ -354,7 +359,8 @@ def test_check_command():
     assert "depth" in E.check_command(dict(good, depth_in=0.14), cmd)  # FieldNET clamped the speed
     assert "service stop" in E.check_command(dict(good, service_stop_deg=None), cmd)
     assert "direction" in E.check_command(dict(good, direction_key="reverse"), cmd)
-    assert "saved plan" in E.check_command(dict(good, plan_id="abc"), cmd)
+    assert E.check_command(dict(good, plan_id="manual-mode"), cmd) is None  # FieldNET's manual mode
+    assert "saved plan" in E.check_command(dict(good, plan_id="3f2a-sector-plan"), cmd)
     dry = E.command_for({"direction": "reverse", "water_on": False, "depth_in": None, "end_deg": 10})
     assert dry["speed_pct"] == 100 and E.check_command({"direction_key": "reverse", "water_on": False, "speed_pct": 100,
                                                          "service_stop_deg": 10.0, "plan_id": None}, dry) is None
@@ -520,7 +526,7 @@ def test_waits_for_the_next_start():
     assert store.programs[1]["state"] == "armed"
 
     def restart():
-        sim._apply({"direction_key": "forward", "water_on": True, "rate": sim.rate, "service_stop_angle": None, "plan_id": None})
+        sim._apply({"direction_key": "forward", "water_on": True, "rate": sim.rate, "service_stop_angle": None, "plan_id": "manual-mode"})
 
     go(run_for(sim, eng, 1, {(sim.t - START) / 3600 + 0.1: restart}))
     assert store.programs[1]["state"] == "running" and store.kinds()[0] == "started"
@@ -541,6 +547,23 @@ def test_command_that_doesnt_match_is_not_sent():
     store, eng = setup(sim)
     go(run_for(sim, eng, 1))
     assert not sim.sent and store.programs[1]["state"] == "paused" and "mismatch" in store.kinds()
+
+
+def test_a_saved_plan_pauses_before_sending():
+    sim = Sim()
+    sim.plan_id = "3f2a-sector-plan"  # someone left a saved plan selected
+    store, eng = setup(sim)
+    go(run_for(sim, eng, 1))
+    assert not sim.sent and store.programs[1]["state"] == "paused" and store.kinds()[-1] == "mismatch"
+    assert "manual" in store.events[-1]["message"]
+
+
+def test_commands_keep_the_panels_manual_mode():
+    sim = Sim()
+    store, eng = setup(sim)
+    go(run_for(sim, eng, 3))
+    assert sim.sent and not sim.ignored and sim.plan_id == "manual-mode"
+    assert sim.service_stop is not None and store.programs[1]["state"] == "running"
 
 
 def test_paused_on_the_dashboard():
