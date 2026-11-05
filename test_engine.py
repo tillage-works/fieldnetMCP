@@ -51,6 +51,7 @@ class Sim:
         self.ignore_service_stop = False
         self.verify_override = None  # (after dict) → after dict, to fake FieldNET quirks
         self.fail_sends = 0
+        self.statuses: list[tuple[str, float]] = []  # every status change, with the angle
         self.applied = [0.0] * self.BINS
         for w in wedges:
             span = P.cw(w.from_deg, w.to_deg) or 360.0
@@ -66,6 +67,7 @@ class Sim:
 
     def set_status(self, s: str) -> None:
         if s != self.status:
+            self.statuses.append((s, round(self.angle, 2)))
             self.status = s
             self.status_at = self.t
             self.reported = (self.angle, self.t)
@@ -437,9 +439,11 @@ def test_w26_live_runs_the_program_and_evens_the_field():
     # Three step commands and the water off at the end; each step's service stop at its end.
     cmds = [(c["direction"], c.get("depth_in"), c.get("service_stop_deg")) for c in sim.sent]
     assert cmds == [("forward", 0.19, 136.6), ("forward", 0.35, 355.5), ("reverse", 0.35, 136.6), ("stopped", None, None)], cmds
-    # The flying change went out before 136.6°, within the lead; the turn-round after the stop at 355.5°.
+    # The speed change went out before 136.6°, within the lead; the reverse just before 355.5°, so the
+    # pivot turned round on the move. Its only service stop was the end of the program.
     assert 134.0 < sim.sent[1]["angle"] < 136.6, sim.sent[1]
-    assert abs(sim.sent[2]["angle"] - 355.5) < 0.05
+    assert 355.0 < sim.sent[2]["angle"] < 355.5, sim.sent[2]
+    assert [s for s in sim.statuses if s[0] == "service-stop"] == [("service-stop", 136.6)], sim.statuses
     assert sim.direction == "stopped" and abs(sim.angle - 136.6) < 0.05 and not sim.water
     assert any("slivers" in n for n in store.runs[1]["plan"]["notes"])
     lo, hi = sim.spread(behind=(61.4, 63.6))
@@ -449,6 +453,27 @@ def test_w26_live_runs_the_program_and_evens_the_field():
     k = store.kinds()
     assert k[0] == "started" and k.count("confirmed") == 3 and k[-1] == "finished", k
     assert not any(e["kind"] in ("override", "stopped", "fault", "overrun", "mismatch") for e in store.events)
+
+
+def test_a_late_reverse_stops_at_the_service_stop_then_turns():
+    sim = Sim()
+    store, eng = setup(sim)
+    real = sim.control
+
+    async def slow(pid, cmd, send, verify):  # this one command takes 5 minutes to reach the panel
+        res = await real(pid, cmd, send, verify)
+        if send and cmd["direction"] == "reverse":
+            at, payload = sim.pending.pop()
+            sim.pending.append((at + 300, payload))
+        return res
+
+    sim.control = slow
+    eng.control = slow
+    go(run_for(sim, eng, 40, until=lambda: store.programs[1]["state"] != "running" and sim.t > START + 3600))
+    assert store.programs[1]["state"] == "finished", store.kinds()
+    stops = [s for s in sim.statuses if s[0] == "service-stop"]
+    assert stops[0] == ("service-stop", 355.5) and stops[-1] == ("service-stop", 136.6), stops
+    assert not any(e["kind"] in ("stopped", "not-taken", "overrun") for e in store.events)
 
 
 def test_w26_practice_sends_nothing_and_follows_until_the_turn():
@@ -596,8 +621,10 @@ def test_overrun_pauses():
     sim = Sim()
     sim.ignore_service_stop = True  # the panel's stop doesn't hold
     store, eng = setup(sim)
-    go(run_for(sim, eng, 20))
+    # Turn-rounds happen on the move, so it's the last step's stop (136.6°) that doesn't hold.
+    go(run_for(sim, eng, 40, until=lambda: store.programs[1]["state"] != "running" and sim.t > START + 3600))
     assert store.programs[1]["state"] == "paused" and store.kinds()[-1] == "overrun", store.kinds()
+    assert "136.6" in store.events[-1]["message"]
 
 
 def test_survives_a_restart():
@@ -624,7 +651,8 @@ def test_polls_only_near_changes():
     go(run_for(sim, eng, 40, until=lambda: store.programs[1]["state"] != "running" and sim.t > START + 3600))
     n_polls = sum(1 for _, p in polls if p)
     hours = (sim.t - START) / 3600
-    assert n_polls <= hours * 2 + 20, (n_polls, hours)  # ~every 30 min, plus a few near each change
+    # ~every 30 min, plus every 20 s for the last few minutes before each change on the move
+    assert n_polls <= hours * 2 + 40, (n_polls, hours)
     assert len(polls) <= hours * 30 + 40, len(polls)
 
 

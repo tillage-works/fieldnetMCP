@@ -22,11 +22,12 @@ Rules (from the advanced irrigation programs brief, agreed with Andrew):
     The panel's plan is left as it is and must be manual (FieldNET's
     "manual-mode"); a saved plan pauses the program. Before sending, the command FieldNET would apply is checked
     against the step; if they differ, nothing is sent and the program pauses.
-  * "Flying" changes (same direction, new depth or water) are sent just before
-    the angle, from a fresh panel position. If one is missed, the service stop
-    stops the pivot there and the change becomes a stop-and-go.
-  * "Stop" changes (turning round) wait for the service stop to halt the
-    pivot, then send the next step.
+  * Changes happen on the move. A new depth or water ("flying") is sent just
+    before its angle, and so is a turn-round: the reverse command is timed to
+    land as the pivot reaches the end of the pass, so it turns without
+    stopping (Andrew: the panel reverses fine on the move). Both are sent from
+    a fresh panel position. If one is missed, the service stop holds the pivot
+    at the angle and the next step goes out from there (a stop-and-go).
   * Manual stops win. The engine only restarts a pivot that its own service
     stop halted, at the angle it expected. Any other stop, a fault, settings
     changed by someone else, or a pivot that runs past its service stop pauses
@@ -265,6 +266,25 @@ def lead_deg(st: dict[str, Any]) -> float:
     return max(1.0, deg_per_s(st) * 120.0)
 
 
+def turn_lead_deg(st: dict[str, Any]) -> float:
+    """How far before the end of a pass to send the reverse: about 90 seconds of travel (the
+    command takes up to a minute to reach the panel), so it lands as the pivot gets there.
+    Early leaves a sliver a pass short (0.4° at W-26's 0.35", 0.1% of the field); late just
+    means a brief stop at the service stop. 0.3° at least."""
+    return max(0.3, deg_per_s(st) * 90.0)
+
+
+def turns_round(steps: list[dict[str, Any]], k: int) -> bool:
+    """Does step k end by turning round into step k+1? (The planner marks those 'stop'.)"""
+    return k + 1 < len(steps) and steps[k + 1]["direction"] != steps[k]["direction"]
+
+
+def on_the_move(steps: list[dict[str, Any]], k: int) -> bool:
+    """Is step k's change to the next sent while the pivot is still moving? Speed or water
+    changes and turn-rounds both are; only the last step ends at its service stop."""
+    return k + 1 < len(steps) and (steps[k]["transition"] == "flying" or turns_round(steps, k))
+
+
 def near_deg(st: dict[str, Any], interval_s: float) -> float:
     """Within this of a flying change, every check asks the panel for a fresh position."""
     return lead_deg(st) + deg_per_s(st) * (interval_s + 60.0)
@@ -340,13 +360,16 @@ def decide_live(run: Run, obs: Obs, now: float, interval_s: float) -> list[Act]:
             return acts + [Act("pause", f"{name} ran past step {k + 1}'s service stop at {fmt_deg(st['end_deg'])} "
                                         f"(now at {fmt_deg(obs.angle)}). The program is paused; check the pivot.",
                                "overrun", alert=True)]
-        if st["transition"] == "flying" and not last and to_go <= lead_deg(st):
+        moving_change = on_the_move(steps, k)
+        turn = turns_round(steps, k)
+        if moving_change and to_go <= (turn_lead_deg(st) if turn else lead_deg(st)):
             if not obs.fresh:
                 return acts + [Act("none", poll_soon=True)]
+            how = "turned round on the move" if turn else "changed on the move"
             return acts + [Act("send", f"Step {k + 1} done at {fmt_deg(obs.angle)}. Step {k + 2}: "
-                                       f"{describe_step(steps[k + 1])} (changed on the move).", "step", step=k + 1)]
+                                       f"{describe_step(steps[k + 1])} ({how}).", "step", step=k + 1)]
         est = estimate_to_go(run, obs.angle, now)
-        soon = st["transition"] == "flying" and est is not None and est <= near_deg(st, interval_s)
+        soon = moving_change and est is not None and est <= near_deg(st, interval_s)
         return acts + [Act("none", poll_soon=soon)]
 
     # Not moving.
@@ -427,7 +450,7 @@ def wake_in(run: Run, obs: Obs | None, now: float, interval_s: float) -> float:
     est = estimate_to_go(run, obs.angle if obs else None, now)
     if est is None or rate <= 0:
         return interval_s
-    if st["transition"] == "flying" or run.practice:
+    if on_the_move(run.steps, run.step) or run.practice:
         return max(20.0, min(interval_s, (est - near_deg(st, interval_s)) / rate))
     return max(60.0, min(interval_s, est / rate))  # waiting for the service stop: the panel reports it
 
@@ -782,7 +805,7 @@ class Engine:
         st = run.steps[run.step]
         fix = run.memo.get("fix") or {}
         est = estimate_to_go(run, None, now)
-        follow = st["transition"] == "flying" or run.practice
+        follow = on_the_move(run.steps, run.step) or run.practice
         poll = (fix.get("step") != run.step or now - fix.get("at", 0) > FIX_MAX_AGE_S
                 or (follow and est is not None and est <= near_deg(st, self.interval_s) * 1.5))
         obs = await self.look(run, poll)

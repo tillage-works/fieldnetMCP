@@ -209,10 +209,13 @@ short:
   it is and must be manual; a saved plan pauses the program before anything is
   sent. Before it is sent, what FieldNET says it would apply is checked against
   the step; if they differ, nothing is sent and the program pauses.
-- **Changes on the move and turn-rounds.** A speed or water change in the same
-  direction is sent just before its angle, from a fresh panel position. Missing
-  it is safe: the service stop holds the pivot and it restarts from there. A
-  turn-round waits for the service stop, then sends the next step.
+- **Changes on the move, turn-rounds included.** A speed or water change is sent
+  just before its angle, and so is a reverse at the end of a pass: it's timed to
+  reach the panel as the pivot gets there (about 90 seconds of travel early), so
+  the pivot turns round without stopping. Both go out from a fresh panel
+  position. Missing one is safe: the service stop holds the pivot at the angle
+  and the next step goes out from there. Only the last step ends at its service
+  stop.
 - **Manual stops win.** The engine only restarts a pivot that its own service
   stop halted, at the angle it expected. Anything else pauses the program and
   raises an alert, and a paused program never moves the pivot again:
