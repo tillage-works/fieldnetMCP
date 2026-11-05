@@ -18,8 +18,9 @@ Rules (from the advanced irrigation programs brief, agreed with Andrew):
     angle, so if this service goes down or misses a check, the pivot stops at
     the right place instead of running on. That is the most important rule.
   * One command per change, with every setting in it (direction, water,
-    depth, service stop, manual mode), because FieldNET applies the whole
-    panel at once. Before sending, the command FieldNET would apply is checked
+    depth, service stop), because FieldNET applies the whole panel at once.
+    The panel's plan is left as it is and must be manual (FieldNET's
+    "manual-mode"); a saved plan pauses the program. Before sending, the command FieldNET would apply is checked
     against the step; if they differ, nothing is sent and the program pauses.
   * "Flying" changes (same direction, new depth or water) are sent just before
     the angle, from a fresh panel position. If one is missed, the service stop
@@ -218,9 +219,14 @@ def check_command(after: dict[str, Any], cmd: dict[str, Any]) -> str | None:
     ss = after.get("service_stop_deg")
     if ss is None or circ_dist(ss, cmd["service_stop_deg"]) > 0.05:
         bad.append(f'service stop {fmt_deg(ss)} (step: {fmt_deg(cmd["service_stop_deg"])})')
-    if after.get("plan_id"):
-        bad.append("a saved plan is selected (step: manual)")
+    if not is_manual(after.get("plan_id")):
+        bad.append(f'saved plan {after.get("plan_id")} is selected (programs need manual mode: set it to manual and arm again)')
     return "; ".join(bad) or None
+
+
+def is_manual(plan_id: Any) -> bool:
+    """FieldNET reports manual mode as plan id "manual-mode" (none at all on some panels)."""
+    return not plan_id or "manual" in str(plan_id).lower()
 
 
 def settings_differ(obs: Obs, st: dict[str, Any]) -> str | None:
@@ -236,7 +242,7 @@ def settings_differ(obs: Obs, st: dict[str, Any]) -> str | None:
     elif not st.get("water_on") and (obs.speed_pct or 0) < 98:
         bad.append(f"{obs.speed_pct}% speed (step: 100%)")
     if obs.service_stop is None:
-        bad.append(f'service stop cleared (step: {fmt_deg(st["end_deg"])})')
+        bad.append(f'no service stop set (step: {fmt_deg(st["end_deg"])})')
     elif circ_dist(obs.service_stop, st["end_deg"]) > 0.3:
         bad.append(f'service stop {fmt_deg(obs.service_stop)} (step: {fmt_deg(st["end_deg"])})')
     return "; ".join(bad) or None
@@ -866,14 +872,19 @@ def _plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
 def from_env(store_url: str, tz: ZoneInfo, pivots: PivotsFn, observe: ObserveFn, plan: PlanFn, control: ControlFn,
              notify: Callable[[], Awaitable[None]] | None) -> Engine | None:
     """Build the engine from environment variables, or None if it isn't switched on."""
-    if os.environ.get("PROGRAMS_ENABLED") != "1":
+    if not _on("PROGRAMS_ENABLED"):
         return None
     if not store_url:
         print("PROGRAMS_ENABLED=1 but PUMPGROUPS_DB_URL is not set; program engine not started.", flush=True)
         return None
     return Engine(PgStore(store_url, tz), pivots, observe, plan, control,
                   interval_s=max(60, int(os.environ.get("PROGRAMS_INTERVAL_S", "180"))),
-                  allow_live=os.environ.get("PROGRAMS_ALLOW_LIVE") == "1", notify=notify)
+                  allow_live=_on("PROGRAMS_ALLOW_LIVE"), notify=notify)
+
+
+def _on(name: str) -> bool:
+    """A switch typed by hand into Render: 1, true, yes or on, with or without quotes or spaces."""
+    return os.environ.get(name, "").strip().strip("'\"").strip().lower() in ("1", "true", "yes", "on")
 
 
 __all__ = ["Engine", "PgStore", "from_env", "decide_live", "decide_practice", "check_command", "split_long_steps",

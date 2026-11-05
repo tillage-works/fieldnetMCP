@@ -205,9 +205,10 @@ short:
   stop to that step's end angle. If this server goes down or misses a check, the
   pivot stops there instead of running on.
 - **One command per change.** Each command carries every setting (direction,
-  water, depth or 100% for a dry step, service stop, manual mode). Before it is
-  sent, what FieldNET says it would apply is checked against the step; if they
-  differ, nothing is sent and the program pauses.
+  water, depth or 100% for a dry step, service stop). The panel's plan is left as
+  it is and must be manual; a saved plan pauses the program before anything is
+  sent. Before it is sent, what FieldNET says it would apply is checked against
+  the step; if they differ, nothing is sent and the program pauses.
 - **Changes on the move and turn-rounds.** A speed or water change in the same
   direction is sent just before its angle, from a fresh panel position. Missing
   it is safe: the service stop holds the pivot and it restarts from there. A
@@ -235,7 +236,7 @@ progress from the step's speed and asks the panel for a fresh position (the
 
 | Variable | |
 | --- | --- |
-| `PROGRAMS_ENABLED` | `1` to run the engine |
+| `PROGRAMS_ENABLED` | `1` to run the engine (`true`/`yes` work too) |
 | `PUMPGROUPS_DB_URL` | the same `pumpgroups_rw` URL as the watcher (programs live in the `pumpgroups` schema) |
 | `PROGRAMS_ALLOW_LIVE` | `1` lets programs armed *Live* send commands. Unset: every program runs as practice |
 | `PUMPGROUPS_NOTIFY_URL` / `PUMPGROUPS_NOTIFY_SECRET` | as for the watcher: program alerts become push notifications too |
