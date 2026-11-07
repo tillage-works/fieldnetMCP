@@ -3,7 +3,7 @@ Pivot log
 =========
 
 A record of every change to every pivot and who made it, for the Hyer Farms
-dashboard's Pivots pages. Two halves:
+dashboard's Irrigation pages. Two halves:
 
   * Commands. Every command this server sends goes through server._apply,
     which writes it here as it's sent: who sent it (a person in the dashboard,

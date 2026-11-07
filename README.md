@@ -88,7 +88,7 @@ read key (`X-API-Key`) and a JSON body of the same parameters (`pivot` = name or
 returns the same result, 400 for bad input, 422 when the planner refuses (with the reason),
 and 502 if FieldNET can't be reached.
 
-The dashboard's Pivots pages read two more, also with the read key, both read only:
+The dashboard's Irrigation pages read two more, also with the read key, both read only:
 
 - `GET /api/pivots/{id}/live` — everything the panel is set to (direction, water, speed and
   depth, service stop, aux 1, auto reverse, plan) plus the raw live status. Add `?poll=1` to
@@ -267,7 +267,7 @@ progress from the step's speed and asks the panel for a fresh position (the
 ## Pivot log (who changed what)
 
 On whenever `PUMPGROUPS_DB_URL` is set. It's a record of every change to every pivot and
-who made it, for the dashboard's **Pivots** pages. It only reads from FieldNET. Details are
+who made it, for the dashboard's **Irrigation** pages. It only reads from FieldNET. Details are
 at the top of [`pivotlog.py`](pivotlog.py).
 
 - **Commands.** Every command this server sends is written as it goes. Each records the
