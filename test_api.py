@@ -378,21 +378,25 @@ def test_pivot_raw_reports_everything_and_survives_missing_paths():
     real_get = server.api_get
 
     async def api_get(path, params=None):
-        if path.endswith("/end-guns"):
+        if path.endswith("/endgun-tables/t1"):
             return [{"id": "eg1", "enabled": True, "areas": [{"start": 10, "end": 80}]}]
         req = httpx.Request("GET", "https://example.test" + path)
         raise httpx.HTTPStatusError("nope", request=req, response=httpx.Response(404, request=req, text="not found"))
 
-    server.api_get = api_get
+    async def no_app_code(**kw):
+        return {"hits": []}
+
+    server.api_get, real_app = api_get, server._app_code_mentions
+    server._app_code_mentions = no_app_code
     try:
         out = asyncio.run(server.pivot_raw("W-26"))
     finally:
-        server.api_get = real_get
+        server.api_get, server._app_code_mentions = real_get, real_app
         restore()
     assert out["controller"]["name"] == "W-26" and out["live"]["accessory_1_on"] is False
     paths = out["paths"]
-    assert paths["/irrigation-controllers/c6f28e12/end-guns"]["status"] == 200
-    assert paths["/irrigation-controllers/c6f28e12/endguns"]["status"] == 404
+    assert paths["/irrigation-controllers/c6f28e12/endgun-tables"]["status"] == 404
+    assert "app_code" in out
 
 
 def test_raw_endpoint():
@@ -412,6 +416,17 @@ def test_raw_endpoint():
         assert client.get("/api/pivots/W-26/raw").status_code == 401
     finally:
         server.pivot_raw = real
+
+
+
+def test_finding_end_gun_code():
+    html = '<html><script type="module" src="/assets/index.4f3a9b2c.js"></script><link rel="modulepreload" href="/assets/vendor.1234abcd.js"></html>'
+    assert server._script_urls(html, "https://app.example/") == ["https://app.example/assets/index.4f3a9b2c.js",
+                                                                 "https://app.example/assets/vendor.1234abcd.js"]
+    js = 'import("./EndGuns.9f8e7d6c.js");' + "x" * 600 + 'fetch(`/irrigation-controllers/${id}/endgun-tables/${t}`,{method:"PUT",body:JSON.stringify({enabled:e})})' + "y" * 600 + 'endGun2'
+    assert "https://app.example/assets/EndGuns.9f8e7d6c.js" in server._script_urls(js, "https://app.example/assets/index.4f3a9b2c.js")
+    hits = server._mentions(js, "f.js")
+    assert len(hits) == 3 and "endgun-tables" in hits[1]["text"] and "enabled" in hits[1]["text"]
 
 
 if __name__ == "__main__":

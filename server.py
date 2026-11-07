@@ -29,6 +29,7 @@ import hashlib
 import hmac
 import math
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
@@ -637,10 +638,76 @@ async def _raw_get(path: str) -> dict[str, Any]:
         return {"status": None, "error": f"{type(e).__name__}: {e}"}
 
 
+# FieldNET's own web app, whose public code shows how it makes calls this server doesn't know yet.
+APP_URLS = ("https://app.myfieldnet.com/", "https://www.myfieldnet.com/", "https://myfieldnet.com/")
+_SCRIPT = re.compile(r"""<(?:script[^>]+src|link[^>]+href)=["']([^"']+\.js[^"']*)["']""", re.I)
+_CHUNK = re.compile(r"""["'`]((?:/?[\w.-]+/)*[\w.-]+\.[0-9a-f]{6,}(?:\.chunk)?\.js)["'`]""", re.I)
+_MENTION = re.compile(r"end[-_ ]?guns?", re.I)
+_app_code: dict[str, Any] = {"at": 0.0, "out": None}
+
+
+def _script_urls(text: str, base: str) -> list[str]:
+    """JavaScript files a page or bundle refers to (script tags, modulepreload links, hashed chunk names)."""
+    from urllib.parse import urljoin
+
+    found = [urljoin(base, m) for m in _SCRIPT.findall(text)] + [urljoin(base, m) for m in _CHUNK.findall(text)]
+    return list(dict.fromkeys(u for u in found if u.startswith("http")))
+
+
+def _mentions(js: str, file: str, room: int = 220) -> list[dict[str, Any]]:
+    """Snippets around each end gun mention, merged when they overlap."""
+    out: list[dict[str, Any]] = []
+    last_end = -1
+    for m in _MENTION.finditer(js):
+        start, end = max(0, m.start() - room), min(len(js), m.end() + room)
+        if out and start <= last_end:
+            out[-1]["text"] = js[out[-1]["from"]:end]
+        else:
+            out.append({"file": file, "from": start, "text": js[start:end]})
+        last_end = end
+    return out
+
+
+async def _app_code_mentions(max_files: int = 80, max_hits: int = 80) -> dict[str, Any]:
+    """Search FieldNET's web app code for end gun calls. Cached for 6 hours; read only."""
+    if _app_code["out"] is not None and time.time() - _app_code["at"] < 6 * 3600:
+        return _app_code["out"]
+    out: dict[str, Any] = {"pages": {}, "files_read": 0, "hits": []}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "fieldnet-mcp"}) as c:
+        for url in APP_URLS:
+            try:
+                r = await c.get(url)
+            except Exception as e:  # noqa: BLE001
+                out["pages"][url] = f"{type(e).__name__}: {e}"[:200]
+                continue
+            out["pages"][url] = r.status_code
+            if r.status_code != 200:
+                continue
+            queue, seen = _script_urls(r.text, str(r.url)), set()
+            while queue and out["files_read"] < max_files and len(out["hits"]) < max_hits:
+                f = queue.pop(0)
+                if f in seen:
+                    continue
+                seen.add(f)
+                try:
+                    js = (await c.get(f)).text
+                except Exception:  # noqa: BLE001
+                    continue
+                out["files_read"] += 1
+                out["hits"].extend(_mentions(js, f))
+                queue.extend(u for u in _script_urls(js, f) if u not in seen)
+            if out["files_read"]:
+                break
+    out["hits"] = out["hits"][:max_hits]
+    _app_code.update(at=time.time(), out=out)
+    return out
+
+
 @mcp.tool()
 async def pivot_raw(pivot: str) -> dict[str, Any]:
     """Everything FieldNET says about one pivot, unprocessed: its record in the controller list, its live
-    panel status, and what a few related FieldNET paths answer. Read only. For working out settings this
+    panel status, what a few related FieldNET paths answer (its end gun tables included), and the places
+    in FieldNET's own web app code that mention end guns. Read only. For working out settings this
     server doesn't handle yet (e.g. how the end gun is switched)."""
     p = await resolve_pivot(pivot)
     eid = p["id"]
@@ -653,10 +720,18 @@ async def pivot_raw(pivot: str) -> dict[str, Any]:
             await ws.close()
     except Exception as e:  # noqa: BLE001
         out["live_error"] = f"{type(e).__name__}: {e}"
-    paths = [f"/irrigation-controllers/{eid}", f"/irrigation-controllers/{eid}/end-guns",
-             f"/irrigation-controllers/{eid}/endguns", f"/irrigation-controllers/{eid}/end-gun-areas",
-             f"/irrigation-controllers/{eid}/settings", f"/irrigation-controllers/{eid}/configuration"]
-    out["paths"] = {path: await _raw_get(path) for path in paths}
+    paths = [f"/irrigation-controllers/{eid}", f"/irrigation-controllers/{eid}/settings",
+             f"/irrigation-controllers/{eid}/endgun-tables", f"/irrigation-controllers/{eid}/end-gun-tables",
+             f"/endgun-tables?irrigation-controller-id={eid}"]
+    for key in ("endgun_1_table_id", "endgun_2_table_id"):
+        tid = (out.get("live") or {}).get(key)
+        if tid:
+            paths += [f"/endgun-tables/{tid}", f"/end-gun-tables/{tid}", f"/irrigation-controllers/{eid}/endgun-tables/{tid}"]
+    out["paths"] = {path: await _raw_get(path) for path in dict.fromkeys(paths)}
+    try:
+        out["app_code"] = await _app_code_mentions()
+    except Exception as e:  # noqa: BLE001
+        out["app_code"] = {"error": f"{type(e).__name__}: {e}"}
     return out
 
 
