@@ -56,7 +56,7 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 | `daily_report` | Hours run and acres per day |
 | `irrigation_overview` | Hours / acres / volume / depth per pivot over a range |
 | `pivot_history` | Raw controller telemetry for the last N hours |
-| `pivot_raw` | Everything FieldNET says about one pivot, unprocessed (controller record, live panel status, a few related paths). For working out settings this server doesn't handle yet, like the end gun |
+| `pivot_raw` | Everything FieldNET says about one pivot, unprocessed: controller record, live panel status, a few related paths (its end gun tables included), and the places in FieldNET's own web app code that mention end guns. Read only. For working out settings this server doesn't handle yet, like the end gun |
 
 ## Even-up planner
 
