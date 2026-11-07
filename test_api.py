@@ -10,6 +10,7 @@ import os
 os.environ.setdefault("FIELDNET_REFRESH_TOKEN", "test-refresh-token")
 os.environ["MCP_AUTH_TOKEN"] = "read-key"
 os.environ.pop("WATCHER_ENABLED", None)
+os.environ.pop("PUMPGROUPS_DB_URL", None)  # no background jobs or database in tests
 
 from starlette.testclient import TestClient  # noqa: E402
 
@@ -133,7 +134,95 @@ def test_program_commands_leave_the_plan_alone():
         server._apply = real
     assert "plan_id" not in seen["changes"], seen
     assert seen["changes"]["service_stop_angle"] == 355.5 and seen["changes"]["service_stop_repeat_on"] is False
-    assert seen["kw"]["depth_in"] == 0.35 and seen["kw"]["who"] == "program" and seen["kw"]["internal"] is True
+    assert seen["kw"]["depth_in"] == 0.35 and seen["kw"]["source"] == "program" and seen["kw"]["internal"] is True
+
+
+def test_apply_writes_what_it_sends_to_the_pivot_log():
+    """Every command sent goes in the pivot log with its source, so the dashboard can say who did what."""
+    import asyncio
+
+    import pivotlog
+
+    fake_fieldnet()
+    recorded = []
+    sent = []
+
+    class Store:
+        async def add_command(self, *a):
+            recorded.append(a)
+            return 1
+
+        async def program_name(self, pivot_id):
+            return "W-26 even up"
+
+    class WS(_WS):
+        async def send(self, m):
+            sent.append(m)
+
+    async def ws():
+        return WS()
+
+    async def live(ws, eid, timeout=10.0):
+        return {"operational_status": "stopped", "direction_key": "forward", "water_on": True, "current_angle": 152.2,
+                "rate": 0.4, "rate_conversion_factor": 0.1417 / server.IN_PER_M, "full_run_time": 10.05 * 3600,
+                "service_stop": None, "service_stop_repeat_on": False, "current_plan_id": "manual-mode",
+                "auto_reverse_on": False, "auto_restart_on": False, "accessory_1_on": False, "rtu_online": True}
+
+    async def ack(ws, eid, kind, topic, timeout):
+        return {"status": "successful"}
+
+    saved = server.ws_session, server.live_status, server.ws_command_status, server.PIVOT_LOG
+    server.ws_session, server.live_status, server.ws_command_status = ws, live, ack
+    server.PIVOT_LOG = pivotlog.PivotLog(Store(), server._pivot_summaries)
+    try:
+        res = asyncio.run(server._apply(None, "W-26", {"direction_key": "forward", "service_stop_angle": 150.6},
+                                        confirm=True, poll=False, internal=True, source="program"))
+        assert res["applied"] and len(sent) == 2
+        pid, name, source, who, message, changes, expected, outcome, angle = recorded[-1]
+        assert (pid, name, source, who, outcome, angle) == ("c6f28e12", "W-26", "program", "W-26 even up", "taken", 152.2)
+        assert message == "Start forward, wet · 0.35″ (40%), service stop 150.6°", message
+        assert expected == {"direction": "forward", "service_stop_deg": 150.6}
+        asyncio.run(server._apply(None, "W-26", {"direction_key": "forward"}, confirm=True, poll=False, internal=True,
+                                  source="pump-group", who="North wells"))
+        assert recorded[-1][2:4] == ("pump-group", "North wells")
+        # Practice sends nothing and logs nothing.
+        n = len(recorded)
+        asyncio.run(server._apply(None, "W-26", {"direction_key": "forward"}, confirm=True, poll=False, internal=True,
+                                  send=False, source="program"))
+        assert len(recorded) == n
+    finally:
+        server.ws_session, server.live_status, server.ws_command_status, server.PIVOT_LOG = saved
+
+
+def test_pivot_live_and_applied():
+    fake_fieldnet()
+    polled = []
+
+    async def poll(ws, eid, timeout=45.0):
+        polled.append(eid)
+        return {"status": "successful", "fresh": True}
+
+    async def live(ws, eid, timeout=10.0):
+        return {"operational_status": "forward-wet", "direction_key": "forward", "water_on": True, "current_angle": 63.3,
+                "rate": 0.746, "rate_conversion_factor": 0.1417 / server.IN_PER_M, "full_run_time": 10.05 * 3600,
+                "service_stop": 136.6, "service_stop_repeat_on": False, "current_plan_id": "manual-mode",
+                "auto_reverse_on": False, "auto_restart_on": False, "accessory_1_on": True, "rtu_online": True}
+
+    real_poll, server.ws_poll, server.live_status = server.ws_poll, poll, live
+    try:
+        r = client.get("/api/pivots/W-26/live", headers=KEY)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["fresh"] is False and not polled and d["settings"]["service_stop_deg"] == 136.6
+        assert d["settings"]["accessory_1"] is True and d["settings"]["depth_in"] == 0.19 and d["panel"]["rtu_online"]
+        assert client.get("/api/pivots/W-26/live?poll=1", headers=KEY).json()["fresh"] is True and polled
+        assert client.get("/api/pivots/W-99/live", headers=KEY).status_code == 404
+        assert client.get("/api/pivots/W-26/live").status_code == 401
+    finally:
+        server.ws_poll = real_poll
+    r = client.get("/api/pivots/W-26/applied?from=2026-09-24&to=2026-11-04", headers=KEY)
+    assert r.status_code == 200 and len(r.json()["wedges"]) == 4 and r.json()["covered_pct"] == 100.0, r.text
+    assert client.get("/api/pivots/W-26/applied?from=yesterday", headers=KEY).status_code == 400
 
 
 if __name__ == "__main__":

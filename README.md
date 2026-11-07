@@ -88,6 +88,16 @@ read key (`X-API-Key`) and a JSON body of the same parameters (`pivot` = name or
 returns the same result, 400 for bad input, 422 when the planner refuses (with the reason),
 and 502 if FieldNET can't be reached.
 
+The dashboard's Irrigation pages read two more, also with the read key, both read only:
+
+- `GET /api/pivots/{id}/live` — everything the panel is set to (direction, water, speed and
+  depth, service stop, aux 1, auto reverse, plan) plus the raw live status. Add `?poll=1` to
+  ask the panel for a fresh report first (5–45 s).
+- `GET /api/pivots/{id}/applied?from=YYYY-MM-DD&to=YYYY-MM-DD` — water applied around the
+  circle as wedges (the Applied Irrigation map); default the last 7 days.
+
+Both take a name or an id, and answer 404 for an unknown pivot and 502 for FieldNET trouble.
+
 The logic is pure and lives in `programs.py` (no FieldNET, no database); `python test_programs.py`
 runs its tests, including the real W-26 case from Nov 2026 and the safety rules over 400
 random fields; `python test_api.py` (with the requirements installed) tests the endpoint.
@@ -183,8 +193,8 @@ decisions are tested in `test_watcher.py` (`python test_watcher.py`).
 - Outside every group's schedule it makes no FieldNET calls.
 - It starts pivots without the preview/confirm step the Claude control tools
   use, because a person already chose the exact settings when they set the
-  group live. Every command is logged (`CONTROL … [watcher]`), and every
-  decision goes to the dashboard's activity log.
+  group live. Every command is logged (`CONTROL … [pump-group: <group>]` and the pivot
+  log), and every decision goes to the dashboard's activity log.
 - It never stops a pivot, and doesn't need `MCP_WRITE_TOKEN`.
 
 ## Optional: irrigation program engine
@@ -253,3 +263,39 @@ progress from the step's speed and asks the panel for a fresh position (the
   keeps track of the water it puts down. The tests cover a full W-26 run (it ends
   3.65–3.70″), practice mode, manual stops, faults, overrides, losing contact
   through a change, failed sends, overruns and a restart part-way through.
+
+## Pivot log (who changed what)
+
+On whenever `PUMPGROUPS_DB_URL` is set. It's a record of every change to every pivot and
+who made it, for the dashboard's **Irrigation** pages. It only reads from FieldNET. Details are
+at the top of [`pivotlog.py`](pivotlog.py).
+
+- **Commands.** Every command this server sends is written as it goes. Each records the
+  source, what it asked for, and whether the panel took it. The sources are:
+  - a person on the dashboard (from phase 2);
+  - a program;
+  - a pump group;
+  - Claude, through the FieldNET Control connector.
+- **Changes.** Every 2½ minutes it reads all pivots in one FieldNET call and compares each
+  pivot with its last look. That last look is kept in the database, so deploys don't lose it.
+  - **What it compares:** running or stopped, direction, wet or dry, speed, service stop,
+    plan, status and contact. Not the angle, and not the end gun (the list only shows
+    what it's doing right now).
+  - **A change that matches a recent command** marks that command *seen on the panel*.
+  - **Changes no command explains** are logged as *outside the portal* (the panel or the
+    FieldNET app). Starts and turn-rounds can also be the panel's own auto restart or
+    auto reverse.
+  - **The pivot's own reports** are logged as such: a service stop or barrier reached, a
+    fault or shutdown, and lost or regained contact.
+
+| Variable | |
+| --- | --- |
+| `PUMPGROUPS_DB_URL` | the same `pumpgroups_rw` URL; the log lives in `pumpgroups.pivot_log` and `pivot_seen` |
+| `PIVOT_LOG_ENABLED` | `0` to switch it off |
+| `PIVOT_LOG_INTERVAL_S` | seconds between looks (default 150, minimum 60) |
+
+- It needs the tables from the dashboard's `npm run create-pumpgroups-db` (re-run it once).
+  Until then it says so in the log and looks again every 10 minutes.
+- Like the watcher, it needs an **always-on** Render plan to catch changes as they happen.
+  After a sleep it still logs what changed, with the time FieldNET gives for the status.
+- `python test_pivotlog.py` tests the comparison and wording with the farm's real readings.
