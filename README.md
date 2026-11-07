@@ -88,6 +88,16 @@ read key (`X-API-Key`) and a JSON body of the same parameters (`pivot` = name or
 returns the same result, 400 for bad input, 422 when the planner refuses (with the reason),
 and 502 if FieldNET can't be reached.
 
+The dashboard's Pivots pages read two more, also with the read key, both read only:
+
+- `GET /api/pivots/{id}/live` — everything the panel is set to (direction, water, speed and
+  depth, service stop, aux 1, auto reverse, plan) plus the raw live status. Add `?poll=1` to
+  ask the panel for a fresh report first (5–45 s).
+- `GET /api/pivots/{id}/applied?from=YYYY-MM-DD&to=YYYY-MM-DD` — water applied around the
+  circle as wedges (the Applied Irrigation map); default the last 7 days.
+
+Both take a name or an id, and answer 404 for an unknown pivot and 502 for FieldNET trouble.
+
 The logic is pure and lives in `programs.py` (no FieldNET, no database); `python test_programs.py`
 runs its tests, including the real W-26 case from Nov 2026 and the safety rules over 400
 random fields; `python test_api.py` (with the requirements installed) tests the endpoint.

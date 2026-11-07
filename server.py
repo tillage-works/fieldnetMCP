@@ -1174,6 +1174,62 @@ async def api_plan_even_up(request: Request):
     return JSONResponse(plan)
 
 
+async def api_pivot_live(request: Request):
+    """GET /api/pivots/{id}/live[?poll=1]: one pivot's full panel settings from FieldNET's live status,
+    for the dashboard's pivot page. poll=1 asks the panel for a fresh report first (5-45 s). Read only.
+    → 200 {pivot, fresh, read_at, settings: what the panel is set to, panel: the raw live status}
+      404 no such pivot · 502 FieldNET trouble"""
+    pid = request.path_params["pivot_id"]
+    poll = request.query_params.get("poll") in ("1", "true", "yes")
+    try:
+        p = await resolve_pivot(pid)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    try:
+        ws = await ws_session()
+        try:
+            fresh = bool((await ws_poll(ws, p["id"])).get("fresh")) if poll else False
+            status = await live_status(ws, p["id"])
+        finally:
+            await ws.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"LIVE error {p.get('name')}: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't read the panel from FieldNET right now."}, status_code=502)
+    settings = _describe(dict(status, direction_key=_effective_direction(status)))
+    settings["last_commanded_direction"] = status.get("direction_key")
+    return JSONResponse({"pivot": {"id": p["id"], "name": p.get("name")}, "fresh": fresh,
+                         "read_at": datetime.now(TZ).isoformat(timespec="seconds"), "settings": settings,
+                         "panel": status})
+
+
+async def api_pivot_applied(request: Request):
+    """GET /api/pivots/{id}/applied?from=YYYY-MM-DD&to=YYYY-MM-DD: water applied around the circle
+    (the Applied Irrigation map as wedges), default the last 7 days. Read only.
+    → 200 {pivot, from, to, covered_pct, wedges} · 400 bad dates · 404 no such pivot · 502 FieldNET trouble"""
+    pid = request.path_params["pivot_id"]
+    q = request.query_params
+    for key in ("from", "to"):
+        v = q.get(key)
+        if v:
+            try:
+                date.fromisoformat(v)
+            except ValueError:
+                return JSONResponse({"error": f"{key} must be a date like 2026-09-24."}, status_code=400)
+    try:
+        p = await resolve_pivot(pid)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    start, end = _range(q.get("from"), q.get("to"), 7)
+    try:
+        wedges = await _applied_wedges(p["id"], start, end)
+    except Exception as e:  # noqa: BLE001
+        print(f"APPLIED error {p.get('name')}: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't read applied water from FieldNET right now."}, status_code=502)
+    covered = sum(w["span_deg"] for w in wedges)
+    return JSONResponse({"pivot": {"id": p["id"], "name": p.get("name")}, "from": start.isoformat(),
+                         "to": end.isoformat(), "covered_pct": round(covered / 3.6, 1), "wedges": wedges})
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1184,6 +1240,8 @@ app.router.routes.append(_Route("/control/mcp", endpoint=_mcp_route.endpoint, me
 app.add_route("/", health, methods=["GET"])
 app.add_route("/health", health, methods=["GET"])
 app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
+app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
+app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
 app.add_middleware(BearerAuth)
 
 if WATCHER or ENGINE:

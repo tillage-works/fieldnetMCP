@@ -136,6 +136,37 @@ def test_program_commands_leave_the_plan_alone():
     assert seen["kw"]["depth_in"] == 0.35 and seen["kw"]["who"] == "program" and seen["kw"]["internal"] is True
 
 
+def test_pivot_live_and_applied():
+    fake_fieldnet()
+    polled = []
+
+    async def poll(ws, eid, timeout=45.0):
+        polled.append(eid)
+        return {"status": "successful", "fresh": True}
+
+    async def live(ws, eid, timeout=10.0):
+        return {"operational_status": "forward-wet", "direction_key": "forward", "water_on": True, "current_angle": 63.3,
+                "rate": 0.746, "rate_conversion_factor": 0.1417 / server.IN_PER_M, "full_run_time": 10.05 * 3600,
+                "service_stop": 136.6, "service_stop_repeat_on": False, "current_plan_id": "manual-mode",
+                "auto_reverse_on": False, "auto_restart_on": False, "accessory_1_on": True, "rtu_online": True}
+
+    real_poll, server.ws_poll, server.live_status = server.ws_poll, poll, live
+    try:
+        r = client.get("/api/pivots/W-26/live", headers=KEY)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["fresh"] is False and not polled and d["settings"]["service_stop_deg"] == 136.6
+        assert d["settings"]["accessory_1"] is True and d["settings"]["depth_in"] == 0.19 and d["panel"]["rtu_online"]
+        assert client.get("/api/pivots/W-26/live?poll=1", headers=KEY).json()["fresh"] is True and polled
+        assert client.get("/api/pivots/W-99/live", headers=KEY).status_code == 404
+        assert client.get("/api/pivots/W-26/live").status_code == 401
+    finally:
+        server.ws_poll = real_poll
+    r = client.get("/api/pivots/W-26/applied?from=2026-09-24&to=2026-11-04", headers=KEY)
+    assert r.status_code == 200 and len(r.json()["wedges"]) == 4 and r.json()["covered_pct"] == 100.0, r.text
+    assert client.get("/api/pivots/W-26/applied?from=yesterday", headers=KEY).status_code == 400
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):
