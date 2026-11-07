@@ -32,8 +32,21 @@ Storage: pumpgroups.pivot_log and pumpgroups.pivot_seen in AgHub Ops DB
 (created by the dashboard's `npm run create-pumpgroups-db`). Read only towards
 FieldNET: nothing here sends anything to a pivot.
 
-The comparison (snap, compare) and the wording are pure, so they're tested
-without FieldNET or a database (test_pivotlog.py).
+Alerts (push notifications through the dashboard, like pump groups and
+programs). An entry or command gets an alert_kind, and the dashboard sends it
+to every subscribed phone that can see Irrigation:
+  * fault      a running pivot shut down (low pressure, alignment, power…)
+  * contact    a running pivot lost contact
+  * stop       a running pivot stopped and no command explains it
+  * not-taken  a change sent from the dashboard or Claude still isn't showing
+               on the panel NOT_TAKEN_S after it was sent
+  * chem       chemigation (aux 1) is still on after the pivot stopped or went
+               dry (checked from the panel's live status at that moment)
+The same pivot and kind alert at most once per ALERT_COOLDOWN_S. Programs and
+pump groups alert on their own commands themselves.
+
+The comparison (snap, compare, mark_alerts) and the wording are pure, so they're
+tested without FieldNET or a database (test_pivotlog.py).
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -53,6 +67,12 @@ SPEED_TOL = 0.6  # percent: FieldNET reports the rate rounded
 STOP_TOL = 0.15  # degrees
 AT_STOP_DEG = 1.5  # a cleared service stop this close to the pivot was FieldNET clearing a one-time stop
 RETRY_MISSING_S = 600  # tables not created yet: look again this often
+NOT_TAKEN_S = 15 * 60  # a dashboard/Claude change not on the panel after this alerts
+NOT_TAKEN_WINDOW_S = 2 * 3600  # only commands this recent are checked
+ALERT_COOLDOWN_S = 30 * 60
+RENUDGE_TICKS = 6  # every ~15 minutes, nudge the dashboard again if alerts are still unsent
+FAULT = re.compile(r"shutdown|fault|alarm|error|safety|powered-off|power-loss")
+ALERT_KINDS = ("fault", "contact", "stop", "not-taken", "chem")
 
 MOVING = ("forward", "reverse")
 FIELDS = ("direction", "water_on", "speed_pct", "service_stop_deg", "plan")
@@ -127,6 +147,8 @@ class Command:
     who: str | None
     expected: dict[str, Any]  # snapshot field -> the value it should show once the panel has it
     seen_fields: set[str] = field(default_factory=set)
+    pivot_id: str = ""
+    message: str = ""
 
 
 @dataclass
@@ -135,6 +157,8 @@ class Entry:
     message: str
     changes: dict[str, dict[str, Any]]
     at: float  # epoch s
+    kind: str = "change"  # 'change' | 'alert' (an alert with no change behind it, e.g. chemigation left on)
+    alert: str | None = None  # one of ALERT_KINDS when this should notify
 
 
 def _label(status: str) -> str:
@@ -253,6 +277,32 @@ def compare(prev: dict[str, Any], cur: dict[str, Any], commands: list[Command], 
     return entries, matches
 
 
+def wet_running(s: dict[str, Any]) -> bool:
+    return s.get("direction") in MOVING and bool(s.get("water_on"))
+
+
+def mark_alerts(prev: dict[str, Any], cur: dict[str, Any], entries: list[Entry]) -> None:
+    """Which of compare()'s entries should notify: a running pivot that shut down, lost contact, or
+    stopped with no command behind it. Sets entry.alert."""
+    was_running = prev.get("direction") in MOVING
+    for e in entries:
+        if e.source == "pivot":
+            if was_running and ("status" in e.changes or "direction" in e.changes) and FAULT.search(cur.get("status") or ""):
+                e.alert = "fault"
+            elif "offline" in e.changes and cur.get("offline") and (was_running or cur.get("direction") in MOVING):
+                e.alert = "contact"
+        elif e.source == "outside":
+            if was_running and "direction" in e.changes and cur.get("direction") == "stopped":
+                e.alert = "stop"
+
+
+def still_not_taken(c: Command, cur: dict[str, Any] | None) -> bool:
+    """A command nothing has matched yet: is the panel still not showing what it asked for?"""
+    if cur is None or not c.expected:
+        return False
+    return not all(same(f, v, cur.get(f)) for f, v in c.expected.items())
+
+
 # ---------------------------------------------------------------------------
 # Commands (pure wording; written by server._apply)
 # ---------------------------------------------------------------------------
@@ -272,8 +322,8 @@ def command_text(diff: dict[str, dict[str, Any]], after: dict[str, Any], plan_na
         was = diff["direction_key"].get("from")
         head = "Stop" if not moving else (f"Turn round: {d}" if was in MOVING else f"Start {d}")
     rate_changed = "speed_pct" in diff or "depth_in" in diff
-    if moving and ("direction_key" in diff and diff["direction_key"].get("from") not in MOVING or "water_on" in diff
-                   or rate_changed):
+    starting = "direction_key" in diff and diff["direction_key"].get("from") not in MOVING
+    if moving and (starting or "water_on" in diff):
         s = {"water_on": after.get("water_on"), "depth_in": after.get("depth_in"), "speed_pct": after.get("speed_pct")}
         parts.append(f"{'wet' if after.get('water_on') else 'dry'} · {_rate(s)}")
     elif "water_on" in diff:
@@ -326,6 +376,9 @@ class Store(Protocol):
                           changes: dict[str, Any], expected: dict[str, Any], outcome: str, angle: float | None) -> int: ...
     async def program_name(self, pivot_id: str) -> str | None: ...
     async def heartbeat(self, error: str | None) -> None: ...
+    async def unseen_commands(self, sent_before_s: float, sent_after_s: float) -> list[Command]: ...
+    async def flag_alert(self, entry_id: int, kind: str) -> None: ...
+    async def unsent_alerts(self) -> int: ...
 
 
 class PgStore:
@@ -368,9 +421,10 @@ class PgStore:
 
     async def add_change(self, pivot_id: str, pivot_name: str, e: Entry, angle: float | None) -> None:
         db = await self.pool()
-        await db.execute("INSERT INTO pumpgroups.pivot_log (at, pivot_id, pivot_name, kind, source, message, changes, angle_deg) "
-                         "VALUES (to_timestamp($1), $2, $3, 'change', $4, $5, $6::jsonb, $7)",
-                         e.at, pivot_id, pivot_name, e.source, e.message, json.dumps(e.changes, default=str), angle)
+        await db.execute("INSERT INTO pumpgroups.pivot_log (at, pivot_id, pivot_name, kind, source, message, changes, angle_deg, "
+                         "alert_kind) VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7::jsonb, $8, $9)",
+                         e.at, pivot_id, pivot_name, e.kind, e.source, e.message, json.dumps(e.changes, default=str), angle,
+                         e.alert)
 
     async def mark_seen(self, command_id: int, fields: list[str]) -> None:
         db = await self.pool()
@@ -402,22 +456,59 @@ class PgStore:
         await db.execute("INSERT INTO pumpgroups.watcher (id, log_check_at, log_error) VALUES (1, now(), $1) "
                          "ON CONFLICT (id) DO UPDATE SET log_check_at = now(), log_error = $1", error)
 
+    async def unseen_commands(self, sent_before_s: float, sent_after_s: float) -> list[Command]:
+        """Dashboard and Claude commands the panel took (or didn't answer) that nothing has matched yet."""
+        db = await self.pool()
+        rows = await db.fetch("SELECT id, extract(epoch FROM at) AS at, pivot_id, source, who, expected, message "
+                              "FROM pumpgroups.pivot_log WHERE kind = 'command' AND source IN ('portal', 'claude') "
+                              "AND outcome IN ('taken', 'no-answer') AND seen_at IS NULL AND alert_kind IS NULL "
+                              "AND expected IS NOT NULL AND expected <> '{}'::jsonb "
+                              "AND at BETWEEN to_timestamp($2) AND to_timestamp($1)", sent_before_s, sent_after_s)
+        out = []
+        for r in rows:
+            exp = r["expected"]
+            exp = json.loads(exp) if isinstance(exp, str) else dict(exp or {})
+            out.append(Command(r["id"], float(r["at"]), r["source"], r["who"], exp, set(), r["pivot_id"], r["message"]))
+        return out
+
+    async def flag_alert(self, entry_id: int, kind: str) -> None:
+        db = await self.pool()
+        await db.execute("UPDATE pumpgroups.pivot_log SET alert_kind = $2 WHERE id = $1 AND alert_kind IS NULL", entry_id, kind)
+
+    async def unsent_alerts(self) -> int:
+        db = await self.pool()
+        return await db.fetchval("SELECT count(*) FROM pumpgroups.pivot_log WHERE alert_kind IS NOT NULL "
+                                 "AND notified_at IS NULL AND at > now() - interval '1 day'")
+
 
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
 PivotsFn = Callable[[], Awaitable[list[dict[str, Any]]]]
+AuxFn = Callable[[str], Awaitable[bool | None]]  # is chemigation (aux 1) on right now? (the panel's live status)
+NotifyFn = Callable[[], Awaitable[None]]  # nudge the dashboard to push unsent alerts
 
 
 class PivotLog:
     def __init__(self, store: Store, pivots: PivotsFn, interval_s: int = CHECK_S,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time, aux_on: AuxFn | None = None,
+                 notify: NotifyFn | None = None) -> None:
         self.store = store
         self.pivots = pivots
         self.interval_s = interval_s
         self.clock = clock
+        self.aux_on = aux_on
+        self.notify = notify
         self.last_check_s: float | None = None
+        self.last_alert: dict[tuple[str, str], float] = {}  # (pivot id, kind) -> when
+
+    def _may_alert(self, pid: str, kind: str, now: float) -> bool:
+        last = self.last_alert.get((pid, kind))
+        if last is not None and now - last < ALERT_COOLDOWN_S:
+            return False
+        self.last_alert[(pid, kind)] = now
+        return True
 
     async def tick(self) -> int:
         """One look at every pivot. Returns how many log rows it wrote."""
@@ -426,12 +517,15 @@ class PivotLog:
         before = await self.store.seen()
         commands = await self.store.open_commands(now - COMMAND_WINDOW_S)
         save: dict[str, dict[str, Any]] = {}
+        current: dict[str, dict[str, Any]] = {}
         wrote = 0
+        alerts = 0
         for p in pivots:
             pid = p.get("id")
             if not pid:
                 continue
             cur = snap(p)
+            current[pid] = cur
             prev = before.get(pid)
             if worth_saving(prev, cur):
                 save[pid] = cur
@@ -443,13 +537,40 @@ class PivotLog:
                 for c in commands.get(pid, []):
                     if c.id == cid:
                         c.seen_fields.update(fields)
+            mark_alerts(prev, cur, entries)
+            if self.aux_on and wet_running(prev) and not wet_running(cur):
+                try:
+                    chem = await self.aux_on(pid)
+                except Exception as e:  # noqa: BLE001
+                    print(f"PIVOTLOG couldn't check chemigation on {cur['name']}: {type(e).__name__}: {e}", flush=True)
+                    chem = None
+                if chem:
+                    how = "stopped" if cur.get("direction") not in MOVING else "running dry"
+                    entries.append(Entry("pivot", f"Chemigation (aux 1) is still on and {cur['name']} is {how}",
+                                         {"accessory_1": {"from": None, "to": True}}, now, kind="alert", alert="chem"))
             for e in entries:
+                if e.alert and not self._may_alert(pid, e.alert, now):
+                    e.alert = None
                 await self.store.add_change(pid, cur["name"], e, cur.get("angle_deg"))
-                print(f"PIVOTLOG {cur['name']} [{e.source}] {e.message}", flush=True)
+                print(f"PIVOTLOG {cur['name']} [{e.source}]{f' ALERT {e.alert}' if e.alert else ''} {e.message}", flush=True)
                 wrote += 1
+                alerts += bool(e.alert)
+        # Changes sent from the dashboard or Claude that still aren't showing on the panel.
+        for c in await self.store.unseen_commands(now - NOT_TAKEN_S, now - NOT_TAKEN_WINDOW_S):
+            cur = current.get(c.pivot_id)
+            if cur is None:
+                continue
+            if still_not_taken(c, cur):
+                await self.store.flag_alert(c.id, "not-taken")
+                print(f"PIVOTLOG {cur['name']} ALERT not-taken: {c.message} ({c.who or c.source})", flush=True)
+                alerts += 1
+            else:
+                await self.store.mark_seen(c.id, list(c.expected))  # it's there now; the change just wasn't caught
         await self.store.save_seen(save)
         await self.store.heartbeat(None)
         self.last_check_s = now
+        if alerts and self.notify:
+            await self.notify()
         return wrote
 
     async def record_command(self, *, pivot_id: str, pivot_name: str, source: str, who: str | None,
@@ -468,11 +589,15 @@ class PivotLog:
     async def run_forever(self) -> None:
         print(f"Pivot log watching every pivot every {self.interval_s}s.", flush=True)
         missing_said = False
+        ticks = 0
         while True:
             wait = self.interval_s
             try:
                 await self.tick()
                 missing_said = False
+                ticks += 1
+                if self.notify and ticks % RENUDGE_TICKS == 0 and await self.store.unsent_alerts():
+                    await self.notify()  # the dashboard was asleep or deploying last time
             except Exception as e:  # noqa: BLE001
                 if "does not exist" in str(e):
                     if not missing_said:
@@ -493,13 +618,13 @@ def _off(v: str | None) -> bool:
     return (v or "").strip().lower() in ("0", "false", "no", "off")
 
 
-def from_env(db_url: str, pivots: PivotsFn) -> PivotLog | None:
+def from_env(db_url: str, pivots: PivotsFn, aux_on: AuxFn | None = None, notify: NotifyFn | None = None) -> PivotLog | None:
     """On whenever the dashboard's database is set (PUMPGROUPS_DB_URL); PIVOT_LOG_ENABLED=0 switches it off."""
     if not db_url or _off(os.environ.get("PIVOT_LOG_ENABLED")):
         return None
     interval = max(60, int(os.environ.get("PIVOT_LOG_INTERVAL_S", str(CHECK_S))))
-    return PivotLog(PgStore(db_url), pivots, interval)
+    return PivotLog(PgStore(db_url), pivots, interval, aux_on=aux_on, notify=notify)
 
 
-__all__ = ["PivotLog", "PgStore", "Command", "Entry", "snap", "compare", "command_text", "expected_from",
-           "outcome_for", "from_env", "SOURCES"]
+__all__ = ["PivotLog", "PgStore", "Command", "Entry", "snap", "compare", "mark_alerts", "still_not_taken",
+           "command_text", "expected_from", "outcome_for", "from_env", "SOURCES", "ALERT_KINDS"]

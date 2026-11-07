@@ -8,8 +8,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from pivotlog import (COMMAND_WINDOW_S, Command, PivotLog, command_text, compare, expected_from, outcome_for, snap,
-                      worth_saving)
+from pivotlog import (ALERT_COOLDOWN_S, COMMAND_WINDOW_S, NOT_TAKEN_S, Command, PivotLog, command_text, compare,
+                      expected_from, mark_alerts, outcome_for, snap, still_not_taken, worth_saving)
 
 NOW = 1_762_538_400.0  # 2025-11-07 18:00 UTC
 
@@ -164,6 +164,10 @@ def test_command_wording():
     assert command_text({"accessory_1": {"from": False, "to": True}, "auto_reverse": {"from": True, "to": False}},
                         {"accessory_1": True, "auto_reverse": False}) == "Auto reverse off, chemigation (aux 1) on"
     assert command_text({"service_stop_deg": {"from": 136.6, "to": None}}, {"service_stop_deg": None}) == "Service stop off"
+    assert command_text({"speed_pct": {"from": 40.5, "to": 60.0}},
+                        {"direction_key": "forward", "water_on": True, "speed_pct": 60.0, "depth_in": 0.24}) == "Speed 60% (0.24″)"
+    assert command_text({"water_on": {"from": True, "to": False}},
+                        {"direction_key": "forward", "water_on": False, "speed_pct": 100.0}) == "Dry · 100%"
     assert command_text({"plan_id": {"from": "manual-mode", "to": "x1"}}, {"plan_id": "x1"}, "Corners") == "Plan Corners"
 
 
@@ -203,8 +207,8 @@ class MemStore:
         return out
 
     async def add_change(self, pivot_id, pivot_name, e, angle):
-        self.rows.append({"id": len(self.rows) + 1, "kind": "change", "pivot_id": pivot_id, "source": e.source,
-                          "message": e.message, "at": e.at})
+        self.rows.append({"id": len(self.rows) + 1, "kind": e.kind, "pivot_id": pivot_id, "source": e.source,
+                          "message": e.message, "at": e.at, "alert": e.alert})
 
     async def mark_seen(self, command_id, fields):
         for r in self.rows:
@@ -215,8 +219,22 @@ class MemStore:
     async def add_command(self, pivot_id, pivot_name, source, who, message, changes, expected, outcome, angle):
         self.rows.append({"id": len(self.rows) + 1, "kind": "command", "pivot_id": pivot_id, "source": source, "who": who,
                           "message": message, "expected": expected, "outcome": outcome, "seen_fields": [],
-                          "seen": False, "at": clock[0]})
+                          "seen": False, "at": clock[0], "alert": None})
         return len(self.rows)
+
+    async def unseen_commands(self, sent_before_s, sent_after_s):
+        return [Command(r["id"], r["at"], r["source"], r["who"], r["expected"], set(), r["pivot_id"], r["message"])
+                for r in self.rows
+                if r["kind"] == "command" and r["source"] in ("portal", "claude") and r["outcome"] in ("taken", "no-answer")
+                and not r["seen"] and not r["alert"] and r["expected"] and sent_after_s <= r["at"] <= sent_before_s]
+
+    async def flag_alert(self, entry_id, kind):
+        r = self.rows[entry_id - 1]
+        if not r["alert"]:
+            r["alert"] = kind
+
+    async def unsent_alerts(self):
+        return sum(1 for r in self.rows if r.get("alert"))
 
     async def program_name(self, pivot_id):
         return self.programs.get(pivot_id)
@@ -283,6 +301,132 @@ def test_recording_never_raises():
                                          diff={"direction_key": {"from": "forward", "to": "stopped"}},
                                          after={"direction_key": "stopped"}, ack="successful"))
     assert out is None
+
+
+# ── Alerts ────────────────────────────────────────────────────────────
+
+
+def alerts(prev, cur, commands=None):
+    p, c = snap(prev), snap(cur)
+    entries, _ = compare(p, c, commands or [], NOW)
+    mark_alerts(p, c, entries)
+    return [(e.source, e.alert) for e in entries]
+
+
+def test_what_alerts_and_what_doesnt():
+    assert alerts(piv("forward-wet", water=True), piv("low-pressure-shutdown", water=True)) == [("pivot", "fault")]
+    assert alerts(piv("forward"), piv("alignment-fault")) == [("pivot", "fault")]
+    assert alerts(piv("forward-wet", water=True), piv("forward-wet", water=True, online="offline")) == [("pivot", "contact")]
+    assert alerts(piv("forward"), piv("stopped")) == [("outside", "stop")]
+    # Normal ends and things that happen while it's stopped don't alert.
+    assert alerts(piv("forward", stop=152.2), piv("service-stop", stop=152.2)) == [("pivot", None)]
+    assert alerts(piv("forward"), piv("soft-barrier-stop")) == [("pivot", None)]
+    assert alerts(piv("stopped"), piv("alignment-fault")) == [("pivot", None)]
+    assert alerts(piv("stopped"), piv("stopped", online="offline")) == [("pivot", None)]
+    assert alerts(piv(), piv("forward")) == [("outside", None)]
+    # A stop someone sent through the portal is explained, so no alert.
+    assert alerts(piv("forward"), piv("stopped"), [cmd(1, {"direction": "stopped"})]) == []
+
+
+def test_not_taken_compares_with_the_panel_now():
+    c = cmd(1, {"direction": "forward", "speed_pct": 50.0})
+    assert still_not_taken(c, snap(piv())) is True
+    assert still_not_taken(c, snap(piv("forward", speed=50))) is False
+    assert still_not_taken(cmd(2, {}), snap(piv())) is False  # nothing it can be checked against
+
+
+def test_alerts_end_to_end():
+    store = MemStore()
+    board = [piv("forward-wet", water=True), piv("forward", pid="k15", name="K-15", water=True)]
+    nudges = []
+    aux = {"w26": True, "k15": False}
+
+    async def pivots():
+        return [dict(p) for p in board]
+
+    async def aux_on(pid):
+        return aux[pid]
+
+    async def notify():
+        nudges.append(clock[0])
+
+    clock[0] = NOW
+    log = PivotLog(store, pivots, clock=lambda: clock[0], aux_on=aux_on, notify=notify)
+
+    async def go():
+        await log.tick()
+        # W-26 shuts down on low pressure with the chemical pumps still on; K-15 is stopped at the panel.
+        clock[0] += 150
+        board[0] = piv("low-pressure-shutdown", water=True)
+        board[1] = piv("stopped", pid="k15", name="K-15", water=True)
+        await log.tick()
+        got = {(r["pivot_id"], r["kind"], r["alert"]) for r in store.rows}
+        assert got == {("w26", "change", "fault"), ("w26", "alert", "chem"), ("k15", "change", "stop")}, got
+        assert [r["message"] for r in store.rows if r["alert"] == "chem"] == ["Chemigation (aux 1) is still on and W-26 is stopped"]
+        assert len(nudges) == 1
+        # Restarted and down again within half an hour: logged, but no second notification.
+        for status in ("forward-wet", "low-pressure-shutdown"):
+            clock[0] += 150
+            board[0] = piv(status, water=True)
+            await log.tick()
+        last = [r for r in store.rows if r["pivot_id"] == "w26"][-2:]  # the shutdown and the chemigation check
+        assert [(r["kind"], r["alert"]) for r in last] == [("change", None), ("alert", None)], last
+        assert len(nudges) == 1
+        clock[0] += ALERT_COOLDOWN_S
+        board[0] = piv("forward-wet", water=True)
+        await log.tick()
+        clock[0] += 150
+        board[0] = piv("low-pressure-shutdown", water=True)
+        await log.tick()
+        last = [r for r in store.rows if r["pivot_id"] == "w26"][-2:]
+        assert [r["alert"] for r in last] == ["fault", "chem"] and len(nudges) == 2
+
+    asyncio.run(go())
+
+
+def test_change_not_taken_alerts_once():
+    store = MemStore()
+    board = [piv()]
+    nudges = []
+
+    async def pivots():
+        return [dict(p) for p in board]
+
+    async def notify():
+        nudges.append(1)
+
+    clock[0] = NOW
+    log = PivotLog(store, pivots, clock=lambda: clock[0], notify=notify)
+
+    async def go():
+        await log.tick()
+        start = {"direction_key": {"from": "stopped", "to": "forward"}}
+        after = {"direction_key": "forward", "water_on": False, "speed_pct": 40.5}
+        a = await log.record_command(pivot_id="w26", pivot_name="W-26", source="portal", who="Sam Crew", diff=start,
+                                     after=after, ack="successful")
+        p = await log.record_command(pivot_id="w26", pivot_name="W-26", source="program", who="Even up", diff=start,
+                                     after=after, ack="successful")
+        clock[0] += NOT_TAKEN_S - 60
+        await log.tick()
+        assert store.rows[a - 1]["alert"] is None  # not yet
+        clock[0] += 120
+        await log.tick()
+        assert store.rows[a - 1]["alert"] == "not-taken" and store.rows[p - 1]["alert"] is None  # programs alert themselves
+        assert len(nudges) == 1
+        clock[0] += 150
+        await log.tick()
+        assert len(nudges) == 1  # once
+        # One that did reach the panel, but between looks, is marked seen instead.
+        b = await log.record_command(pivot_id="w26", pivot_name="W-26", source="claude", who="Claude",
+                                     diff={"speed_pct": {"from": 40.5, "to": 60.0}},
+                                     after={"direction_key": "stopped", "speed_pct": 60.0}, ack="successful")
+        board[0] = piv(speed=60)
+        store.snaps["w26"]["speed_pct"] = 60.0  # the change was already in the stored look
+        clock[0] += NOT_TAKEN_S + 60
+        await log.tick()
+        assert store.rows[b - 1]["seen"] and store.rows[b - 1]["alert"] is None
+
+    asyncio.run(go())
 
 
 if __name__ == "__main__":
