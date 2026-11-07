@@ -1176,7 +1176,17 @@ async def _pivot_summaries() -> list[dict[str, Any]]:
     return [summarize_pivot(p) for p in await get_pivots(max_age_s=30)]
 
 
-PIVOT_LOG = _pivotlog.from_env(os.environ.get("PUMPGROUPS_DB_URL", ""), _pivot_summaries)
+async def _pivot_aux_on(pivot_id: str) -> bool | None:
+    """Chemigation (aux 1) on right now, from the panel's live status."""
+    ws = await ws_session()
+    try:
+        return bool((await live_status(ws, pivot_id)).get("accessory_1_on"))
+    finally:
+        await ws.close()
+
+
+PIVOT_LOG = _pivotlog.from_env(os.environ.get("PUMPGROUPS_DB_URL", ""), _pivot_summaries, aux_on=_pivot_aux_on,
+                               notify=_engine_notify)
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1404,18 @@ async def api_pivot_control(request: Request):
     return JSONResponse(res)
 
 
+async def api_pivot_raw(request: Request):
+    """GET /api/pivots/{id}/raw: pivot_raw over HTTP (read key), for the dashboard's FieldNET details."""
+    try:
+        out = await pivot_raw(request.path_params["pivot_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    except Exception as e:  # noqa: BLE001
+        print(f"RAW error: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't read FieldNET right now."}, status_code=502)
+    return JSONResponse(json.loads(json.dumps(out, default=str)), headers={"Cache-Control": "no-store"})
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1407,6 +1429,7 @@ app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
 app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/control", api_pivot_control, methods=["POST"])
+app.add_route("/api/pivots/{pivot_id}/raw", api_pivot_raw, methods=["GET"])
 app.add_middleware(BearerAuth)
 
 if WATCHER or ENGINE or PIVOT_LOG:

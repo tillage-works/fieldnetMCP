@@ -395,6 +395,25 @@ def test_pivot_raw_reports_everything_and_survives_missing_paths():
     assert paths["/irrigation-controllers/c6f28e12/endguns"]["status"] == 404
 
 
+def test_raw_endpoint():
+    fake_fieldnet()
+    real = server.pivot_raw
+
+    async def raw(pivot):
+        if pivot != "W-26":
+            raise ValueError("No pivot named that")
+        return {"pivot": "W-26", "controller": {"id": "c6f28e12"}, "paths": {}}
+
+    server.pivot_raw = raw
+    try:
+        r = client.get("/api/pivots/W-26/raw", headers=KEY)
+        assert r.status_code == 200 and r.json()["controller"]["id"] == "c6f28e12"
+        assert client.get("/api/pivots/W-99/raw", headers=KEY).status_code == 404
+        assert client.get("/api/pivots/W-26/raw").status_code == 401
+    finally:
+        server.pivot_raw = real
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):

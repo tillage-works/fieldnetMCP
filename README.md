@@ -317,4 +317,29 @@ at the top of [`pivotlog.py`](pivotlog.py).
   Until then it says so in the log and looks again every 10 minutes.
 - Like the watcher, it needs an **always-on** Render plan to catch changes as they happen.
   After a sleep it still logs what changed, with the time FieldNET gives for the status.
-- `python test_pivotlog.py` tests the comparison and wording with the farm's real readings.
+- `python test_pivotlog.py` tests the comparison, wording and alerts with the farm's real readings.
+
+**Alerts.** The pivot log also raises push notifications. It marks the entry, and the
+dashboard sends it, through the same `PUMPGROUPS_NOTIFY_URL` / `PUMPGROUPS_NOTIFY_SECRET` as
+the watcher, to every subscribed phone that can see Irrigation:
+
+| Alert | When |
+| --- | --- |
+| Shut down | a running pivot goes to a fault or shutdown status (low pressure, alignment, power…) |
+| Lost contact while running | a running pivot goes offline |
+| Stopped outside the portal | a running pivot stops and no command explains it |
+| Change not taken | a change sent from the dashboard or Claude still isn't showing on the panel 15 minutes later |
+| Chemigation on, not watering | aux 1 is still on after the pivot stops or goes dry (read from the panel at that moment) |
+
+- Normal ends (service stops, barriers) don't alert, nor does anything that happens while a
+  pivot is already stopped.
+- The same pivot and kind alert at most once every 30 minutes.
+- Programs and pump groups alert on their own commands themselves.
+- Unsent alerts are nudged again every ~15 minutes for a day, in case the dashboard was
+  asleep or deploying.
+- Alerts need the `alert_kind` and `notified_at` columns: re-run the dashboard's
+  `npm run create-pumpgroups-db`. Until then the log says it needs the update and pauses.
+  Nothing is lost: changes made meanwhile are logged once it's back.
+
+`GET /api/pivots/{id}/raw` (read key) is `pivot_raw` over HTTP, for the dashboard's owners-only
+*FieldNET details* section.
