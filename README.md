@@ -111,6 +111,10 @@ Both take a name or an id, and answer 404 for an unknown pivot and 502 for Field
     settings changed in between, it sends nothing and returns a fresh preview.
 - **Logged** in the pivot log as the person (`source = portal`, `who`).
 
+`POST /api/pivots/{id}/endgun` (same two keys) switches one end gun:
+`{who, endgun: 1-4, enabled, confirm, preview_token}`. It previews, then sends on confirm, and is
+logged like `/control`. See *End guns* below.
+
 The logic is pure and lives in `programs.py` (no FieldNET, no database); `python test_programs.py`
 runs its tests, including the real W-26 case from Nov 2026 and the safety rules over 400
 random fields; `python test_api.py` (with the requirements installed) tests the endpoint.
@@ -129,6 +133,7 @@ connectors with the same URL; both paths serve the same server) and
 | `pivot_control_preview` | Current control settings for a pivot |
 | `pivot_control` | Everything in one command: direction (forward/reverse/stopped), water on/off, speed (percent, inches per pass, or hours per circle), service stop (set/clear, repeat), plan, auto-reverse, auto-restart, accessory 1 |
 | `stop_pivot` | Stop, leaving the other settings alone |
+| `endgun_control` | Turn end gun 1 or 2 on (it sprays in the areas of its end gun table) or off |
 | `list_plans` | Names of the saved plans on a pivot |
 
 FieldNET's Apply sends the whole control panel at once, so all the changes for
@@ -146,8 +151,23 @@ connector holding only the read key gets "read access only" from these tools.
 Every applied command is logged in Render's Logs as `CONTROL <time> <pivot> <diff>`.
 Commands are sent exactly the way the web app's dashboard sends them
 (`pivot-control-dashboard-apply` over the WebSocket) and the server waits for
-the acknowledgement. Endgun enable/disable is not included (it lives in the
-endgun tables, a different flow; `pivot_raw` shows what FieldNET has for it).
+the acknowledgement.
+
+**End guns** are switched with their own command, not the control panel's apply. It was found
+in FieldNET's own web app (`nextgen.myfieldnet.com`, the end gun page) with `pivot_raw`:
+- It reads the pivot's `endgun-status`.
+- It copies that into an apply form: `equipment_id`, `endgun_1..4_active_table` (1 where the
+  status has none, as the app does) and `endgun_1..4_enabled`.
+- It sends the form as `{command_type: "endgun-apply", payload}`, and the result comes back
+  on the `endgun-apply` topic.
+
+`endgun_control` (and the dashboard's `POST /api/pivots/{id}/endgun`) does exactly that:
+- It changes only the one gun's on/off. Active tables and the other guns go back as FieldNET
+  has them.
+- It previews first and sends on confirm, then reads the status back.
+- Each gun's spray areas are its tables (`/irrigation-controllers/{id}/endguns/{n}/tables/{t}`),
+  which are set up in FieldNET.
+- Only pivot-control panels; Series 700 panels use a different command and are refused.
 
 **Chemigation (accessory 1).** On this farm aux 1 runs the chemical pumps, so it only runs
 with the pivot running wet:

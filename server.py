@@ -930,6 +930,143 @@ async def ws_command_status(ws, equipment_id: str, kind: str, topic: str, timeou
     return last
 
 
+# ---------------------------------------------------------------------------
+# End guns: switched with their own command, not the control panel's apply.
+# Found in FieldNET's web app (nextgen.myfieldnet.com, the "app-endgun-command"
+# component): it reads the pivot's "endgun-status", copies it into an apply form
+# (equipment_id, endgun_1..4_active_table with 1 where the status has none,
+# endgun_1..4_enabled) and sends {command_type: "endgun-apply", payload: form}.
+# Results come back on the "endgun-apply" topic. Series 700 panels use a
+# different command, so only pivot-control panels are handled here.
+# ---------------------------------------------------------------------------
+
+ENDGUN_APPLY = "endgun-apply"
+ENDGUN_POLL = "endgun-poll"
+ENDGUNS = (1, 2, 3, 4)
+
+
+async def endgun_status(ws, equipment_id: str, timeout: float = 8.0) -> dict[str, Any]:
+    """The pivot's end gun status (enabled flags and active tables), as FieldNET's app reads it."""
+    await ws.send(json.dumps({"command_type": "subscribe", "id": equipment_id, "event_type": "endgun-status"}))
+    msg = await ws_wait(ws, lambda m: m.get("event_type") == "endgun-status"
+                        and (m.get("payload") or {}).get("equipment_id", equipment_id) == equipment_id, timeout)
+    if not msg:
+        raise TimeoutError("No end gun status from FieldNET for this pivot.")
+    return msg["payload"]
+
+
+async def ws_topic_status(ws, equipment_id: str, topic: str, timeout: float) -> dict[str, Any] | None:
+    """Final status of a command on `topic`, whatever the event's own name (endgun-apply's isn't documented)."""
+    last: dict[str, Any] | None = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = await ws_wait(ws, lambda m: isinstance(m.get("payload"), dict)
+                            and m["payload"].get("equipment_id") == equipment_id
+                            and m["payload"].get("event_type") == topic and "status" in m["payload"],
+                            max(0.1, deadline - time.time()))
+        if not msg:
+            break
+        last = msg["payload"]
+        if (last.get("status") or "") in FINAL_CMD_STATES:
+            return last
+    return last
+
+
+def endgun_args(status: dict[str, Any], equipment_id: str, enable: dict[int, bool]) -> dict[str, Any]:
+    """The apply form FieldNET's app sends, from the end gun status, with `enable` changed."""
+    args: dict[str, Any] = {"equipment_id": status.get("equipment_id") or equipment_id}
+    for n in ENDGUNS:
+        t = status.get(f"endgun_{n}_active_table")
+        args[f"endgun_{n}_active_table"] = t if t is not None else 1  # the app's `?? 1`
+    for n in ENDGUNS:
+        args[f"endgun_{n}_enabled"] = status.get(f"endgun_{n}_enabled")
+    for n, on in enable.items():
+        args[f"endgun_{n}_enabled"] = bool(on)
+    return args
+
+
+def _endguns(d: dict[str, Any]) -> dict[str, bool]:
+    return {f"endgun_{n}_enabled": d[f"endgun_{n}_enabled"] for n in ENDGUNS if d.get(f"endgun_{n}_enabled") is not None}
+
+
+async def _endgun_apply(ctx: Context | None, pivot: str, endgun: int, enabled: bool, confirm: bool,
+                        preview_token: str | None = None, poll: bool = True, source: str | None = None,
+                        who: str = "", authorized: bool = False) -> dict[str, Any]:
+    """Turn one end gun on (it sprays in its table's areas) or off, previewed then sent, like _apply.
+    Everything else in the end gun form is sent back as FieldNET has it."""
+    if not authorized:
+        _require_write(ctx)
+    src = source or "claude"
+    by = who if authorized else "Claude"
+    if endgun not in ENDGUNS:
+        raise ValueError("endgun must be 1 to 4.")
+    p = await resolve_pivot(pivot)
+    eid, name = p["id"], p.get("name")
+    ws = await ws_session()
+    try:
+        poll_result = None
+        if poll:
+            try:
+                await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": ENDGUN_POLL}))
+                await ws.send(json.dumps({"command_type": ENDGUN_POLL, "payload": {"equipment_id": eid}}))
+                st = await ws_topic_status(ws, eid, ENDGUN_POLL, 45.0)
+                poll_result = {"status": (st or {}).get("status") or "no-response"}
+            except Exception as e:  # noqa: BLE001 - a fresh reading is nice to have, not required
+                poll_result = {"status": f"error: {type(e).__name__}"}
+        live = await live_status(ws, eid)
+        if (live.get("pivot_type") or p.get("subtype")) != "pivot-control":
+            return {"pivot": name, "applied": False, "error": "End gun control isn't supported for this panel type yet."}
+        if not live.get("rtu_online"):
+            return {"pivot": name, "applied": False, "error": "RTU is offline; command would not be delivered."}
+        status = await endgun_status(ws, eid)
+        cur = status.get(f"endgun_{endgun}_enabled")
+        if cur is None:
+            return {"pivot": name, "applied": False, "error": f"{name} has no end gun {endgun}."}
+        args = endgun_args(status, eid, {endgun: enabled})
+        token = _payload_token(args)
+        key = f"endgun_{endgun}_enabled"
+        diff = {key: {"from": cur, "to": bool(enabled)}} if bool(cur) != bool(enabled) else {}
+        summary = {"poll": poll_result, "endgun": endgun, "final_settings": _endguns(args),
+                   "pivot_will": f"END GUN {endgun} {'ON (sprays in its areas)' if enabled else 'OFF'}"}
+        if not confirm or preview_token != token:
+            out = {"pivot": name, "applied": False, "preview": True, "current": _endguns(status), "would_change": diff,
+                   **summary, "preview_token": token,
+                   "next_step": "Show this to the user. If they approve, call again with confirm=true and this preview_token."}
+            if confirm and preview_token != token:
+                out["note"] = "Not sent: the end gun settings changed since the preview. This is a fresh preview."
+            return out
+        if not diff:
+            return {"pivot": name, "applied": False, "no_change": True, "note": "No change from current state.",
+                    "current": _endguns(status), **summary}
+        print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {name} [{src}{f': {by}' if by else ''}] "
+              f"{json.dumps(diff)}", flush=True)
+        await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": ENDGUN_APPLY}))
+        await ws.send(json.dumps({"command_type": ENDGUN_APPLY, "payload": args}))
+        ack = await ws_topic_status(ws, eid, ENDGUN_APPLY, 45.0)
+        ack_status = (ack or {}).get("status") or "no-response"
+        result: dict[str, Any] = {"pivot": name, "applied": ack_status == "successful", "sent": True,
+                                  "panel_ack": ack_status, "changed": diff, "current": _endguns(status), **summary}
+        if ack_status == "failure":
+            result["error"] = "The panel reported the end gun change FAILED."
+        elif ack_status == "waiting-for-online-status":
+            result["note"] = "Queued: the panel is offline; FieldNET will deliver it when it reconnects."
+        elif ack_status != "successful":
+            result["note"] = "Sent, but no final acknowledgement from the panel within 45 s."
+        try:
+            now = await endgun_status(ws, eid, timeout=8.0)
+            result["now"] = _endguns(now)
+            if ack_status not in ("successful", "failure") and now.get(key) == bool(enabled):
+                result["applied"] = True  # FieldNET already shows it
+        except Exception:  # noqa: BLE001
+            pass
+        if PIVOT_LOG:
+            await PIVOT_LOG.record_command(pivot_id=eid, pivot_name=name, source=src, who=by or None, diff=diff,
+                                           after=_endguns(args), ack=ack_status, angle=live.get("current_angle"))
+        return result
+    finally:
+        await ws.close()
+
+
 async def ws_poll(ws, equipment_id: str, timeout: float = 45.0) -> dict[str, Any]:
     """Ask the panel for a fresh report (the app's Poll button)."""
     await ws.send(json.dumps({"command_type": "subscribe", "id": equipment_id, "event_type": POLL_TOPIC}))
@@ -986,6 +1123,10 @@ def _describe(status: dict[str, Any], rate: float | None = None) -> dict[str, An
         "auto_reverse": status.get("auto_reverse_on"),
         "auto_restart": status.get("auto_restart_on"),
         "accessory_1": status.get("accessory_1_on"),
+        "endgun_1_enabled": status.get("endgun_1_enabled"),
+        "endgun_2_enabled": status.get("endgun_2_enabled"),
+        "endgun_1_on": status.get("endgun_1_on"),
+        "endgun_2_on": status.get("endgun_2_on"),
         "rtu_online": status.get("rtu_online"),
     }
 
@@ -1216,6 +1357,14 @@ if MCP_WRITE_TOKEN:
             raise ValueError("No changes given.")
         return await _apply(ctx, pivot, ch, confirm, preview_token,
                             speed_pct=speed_pct, depth_in=depth_in, hours=hours, plan=plan)
+
+    @mcp.tool()
+    async def endgun_control(pivot: str, endgun: int, enabled: bool, confirm: bool = False,
+                             preview_token: str | None = None, ctx: Context = None) -> dict[str, Any]:  # type: ignore[assignment]
+        """Turn a pivot's end gun on (it sprays in the areas of its end gun table) or off. endgun is 1 or 2.
+        Previews first; confirm=true with the preview_token to send. Separate from pivot_control: FieldNET
+        switches end guns with their own command."""
+        return await _endgun_apply(ctx, pivot, int(endgun), bool(enabled), confirm, preview_token)
 
     @mcp.tool()
     async def stop_pivot(pivot: str, confirm: bool = False, preview_token: str | None = None,
@@ -1567,6 +1716,45 @@ async def api_pivot_raw(request: Request):
     return JSONResponse(json.loads(json.dumps(out, default=str)), headers={"Cache-Control": "no-store"})
 
 
+async def api_pivot_endgun(request: Request):
+    """POST /api/pivots/{id}/endgun: the dashboard's end gun switch. Same keys as /control (read key and
+    X-Control-Key). Body: {who, endgun: 1-4, enabled: true|false, confirm, preview_token}. Without confirm it
+    previews (and asks the panel for fresh end gun settings); with confirm and the token it sends.
+    → 200 the preview or result · 400 · 401/403 · 404 · 502 · 503"""
+    if not PORTAL_CONTROL_KEY:
+        return JSONResponse({"error": "Control from the dashboard isn't switched on here (PORTAL_CONTROL_KEY)."},
+                            status_code=503)
+    if not hmac.compare_digest(request.headers.get("x-control-key", "").encode(), PORTAL_CONTROL_KEY.encode()):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "Send a JSON body."}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "Send {who, endgun, enabled}."}, status_code=400)
+    who = str(body.get("who") or "").strip()[:80]
+    gun, enabled = body.get("endgun"), body.get("enabled")
+    if not who:
+        return JSONResponse({"error": "Say who is making the change (who)."}, status_code=400)
+    if isinstance(gun, bool) or gun not in ENDGUNS:
+        return JSONResponse({"error": "endgun must be 1 to 4."}, status_code=400)
+    if not isinstance(enabled, bool):
+        return JSONResponse({"error": "enabled must be true or false."}, status_code=400)
+    try:
+        await resolve_pivot(request.path_params["pivot_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    confirm = body.get("confirm") is True
+    try:
+        res = await _endgun_apply(None, request.path_params["pivot_id"], gun, enabled, confirm, body.get("preview_token"),
+                                  poll=not confirm, source="portal", who=who, authorized=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"ENDGUN error (dashboard, {who}): {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't reach the panel through FieldNET right now."}, status_code=502)
+    res.pop("next_step", None)
+    return JSONResponse(res)
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1580,6 +1768,7 @@ app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
 app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/control", api_pivot_control, methods=["POST"])
+app.add_route("/api/pivots/{pivot_id}/endgun", api_pivot_endgun, methods=["POST"])
 app.add_route("/api/pivots/{pivot_id}/raw", api_pivot_raw, methods=["GET"])
 app.add_middleware(BearerAuth)
 

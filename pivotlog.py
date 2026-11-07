@@ -337,6 +337,9 @@ def command_text(diff: dict[str, dict[str, Any]], after: dict[str, Any], plan_na
         parts.append("stop every pass" if after.get("service_stop_repeat") else "stop once")
     if "plan_id" in diff:
         parts.append(f"plan {plan_name or ('manual' if norm_plan(after.get('plan_id')) == 'manual' else after.get('plan_id'))}")
+    for n in (1, 2, 3, 4):
+        if f"endgun_{n}_enabled" in diff:
+            parts.append(f"end gun {n} {'on' if after.get(f'endgun_{n}_enabled') else 'off'}")
     for key, name in (("auto_reverse", "auto reverse"), ("auto_restart", "auto restart"),
                       ("accessory_1", "chemigation (aux 1)")):
         if key in diff:

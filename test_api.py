@@ -446,6 +446,99 @@ def test_finding_end_gun_code():
     assert len(got) == 1 and 'y("equipment_id")' in got[0]["text"] and "endgun_1_active_table" in got[0]["text"]
 
 
+def _endgun_fakes(status=None, pivot_type="pivot-control"):
+    """The control fakes plus an end gun status (W-26's real one by default) and endgun-apply capture."""
+    import json as _json
+
+    sent, recorded, polls, restore = _control_fakes({"pivot_type": pivot_type})
+    applied = []
+    eg = dict(status or {"equipment_id": "c6f28e12", "endgun_1_enabled": True, "endgun_2_enabled": True,
+                         "endgun_3_enabled": None, "endgun_4_enabled": None, "endgun_1_active_table": None,
+                         "endgun_2_active_table": None, "endgun_3_active_table": None, "endgun_4_active_table": None,
+                         "endgun_1_active_table_id": "185b8093", "endgun_2_active_table_id": "d035eff8"})
+
+    class WS(_WS):
+        async def send(self, m):
+            msg = _json.loads(m)
+            if msg.get("command_type") == server.ENDGUN_APPLY:
+                applied.append(msg["payload"])
+                for n in server.ENDGUNS:
+                    if msg["payload"].get(f"endgun_{n}_enabled") is not None:
+                        eg[f"endgun_{n}_enabled"] = msg["payload"][f"endgun_{n}_enabled"]
+
+    async def ws():
+        return WS()
+
+    async def status(ws, eid, timeout=8.0):
+        return dict(eg)
+
+    async def topic(ws, eid, topic, timeout):
+        return {"status": "successful"}
+
+    saved = (server.ws_session, server.endgun_status, server.ws_topic_status)
+    server.ws_session, server.endgun_status, server.ws_topic_status = ws, status, topic
+
+    def restore_all():
+        server.ws_session, server.endgun_status, server.ws_topic_status = saved
+        restore()
+
+    return applied, recorded, restore_all
+
+
+def test_endgun_form_is_what_fieldnets_app_sends():
+    status = {"equipment_id": "c6f28e12", "endgun_1_enabled": True, "endgun_2_enabled": False, "endgun_3_enabled": None,
+              "endgun_4_enabled": None, "endgun_1_active_table": 3, "endgun_2_active_table": None,
+              "endgun_3_active_table": None, "endgun_4_active_table": None}
+    assert server.endgun_args(status, "c6f28e12", {1: False}) == {
+        "equipment_id": "c6f28e12",
+        "endgun_1_active_table": 3, "endgun_2_active_table": 1, "endgun_3_active_table": 1, "endgun_4_active_table": 1,
+        "endgun_1_enabled": False, "endgun_2_enabled": False, "endgun_3_enabled": None, "endgun_4_enabled": None,
+    }
+
+
+def test_endgun_switch_previews_then_sends_as_the_person():
+    applied, recorded, restore = _endgun_fakes()
+    try:
+        body = {"who": "Sam Crew", "endgun": 1, "enabled": False}
+        prev = client.post("/api/pivots/W-26/endgun", json=body, headers=CONTROL).json()
+        assert prev["preview"] and prev["would_change"] == {"endgun_1_enabled": {"from": True, "to": False}} and not applied
+        assert prev["pivot_will"] == "END GUN 1 OFF" and "next_step" not in prev
+        stale = client.post("/api/pivots/W-26/endgun", json={**body, "confirm": True, "preview_token": "old"}, headers=CONTROL)
+        assert stale.json().get("preview") and not applied
+        res = client.post("/api/pivots/W-26/endgun", json={**body, "confirm": True, "preview_token": prev["preview_token"]},
+                          headers=CONTROL).json()
+        assert res["applied"] and res["panel_ack"] == "successful" and res["now"]["endgun_1_enabled"] is False, res
+        assert applied == [{"equipment_id": "c6f28e12", "endgun_1_active_table": 1, "endgun_2_active_table": 1,
+                            "endgun_3_active_table": 1, "endgun_4_active_table": 1, "endgun_1_enabled": False,
+                            "endgun_2_enabled": True, "endgun_3_enabled": None, "endgun_4_enabled": None}]
+        assert recorded[-1][2:5] == ("portal", "Sam Crew", "End gun 1 off") and recorded[-1][6] == {}  # nothing to watch for
+        # Already off: nothing to send.
+        again = client.post("/api/pivots/W-26/endgun", json=body, headers=CONTROL).json()
+        assert again["would_change"] == {}
+    finally:
+        restore()
+
+
+def test_endgun_switch_refuses_what_it_cant_do():
+    applied, recorded, restore = _endgun_fakes()
+    try:
+        r = client.post("/api/pivots/W-26/endgun", json={"who": "Sam", "endgun": 3, "enabled": True}, headers=CONTROL)
+        assert r.status_code == 200 and "has no end gun 3" in r.json()["error"]
+        for bad in ({"endgun": 1, "enabled": True}, {"who": "Sam", "endgun": 5, "enabled": True},
+                    {"who": "Sam", "endgun": True, "enabled": True}, {"who": "Sam", "endgun": 1, "enabled": "off"}):
+            assert client.post("/api/pivots/W-26/endgun", json=bad, headers=CONTROL).status_code == 400, bad
+        assert client.post("/api/pivots/W-26/endgun", json={"who": "Sam", "endgun": 1, "enabled": False},
+                           headers=KEY).status_code == 403
+    finally:
+        restore()
+    applied, recorded, restore = _endgun_fakes(pivot_type="700-series")
+    try:
+        r = client.post("/api/pivots/W-26/endgun", json={"who": "Sam", "endgun": 1, "enabled": False}, headers=CONTROL)
+        assert "isn't supported" in r.json()["error"] and not applied
+    finally:
+        restore()
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):
