@@ -811,7 +811,8 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
                  preview_token: str | None = None, poll: bool = True,
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
                  plan: str | None = None, internal: bool = False, send: bool = True,
-                 verify: "Callable[[dict[str, Any]], str | None] | None" = None, who: str = "watcher") -> dict[str, Any]:
+                 verify: "Callable[[dict[str, Any]], str | None] | None" = None,
+                 source: str | None = None, who: str = "") -> dict[str, Any]:
     """Build ONE complete control-panel payload and (on confirm) send it once.
 
     FieldNET applies the whole panel at once, so every field is sent every
@@ -824,7 +825,13 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
     step, because a person already approved these settings when they set the
     group live or armed the program. send=False builds and checks everything but
     sends nothing (practice). verify(final_settings) returns a reason when what
-    FieldNET would apply doesn't match what was meant; then nothing is sent."""
+    FieldNET would apply doesn't match what was meant; then nothing is sent.
+
+    Every command sent is written to the pivot log (pivotlog.py) with its source:
+    'pump-group' (who = the group), 'program' (the program's name is looked up),
+    'portal' (who = the person) or, for the FieldNET Control connector, 'claude'."""
+    src = source or ("pump-group" if internal else "claude")
+    by = who if internal else "Claude"
     if not internal:
         _require_write(ctx)
     p = await resolve_pivot(pivot)
@@ -894,7 +901,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             return {"pivot": p["name"], "applied": False, "no_change": True, "note": "No change from current state.",
                     "current": before, **summary}
         print(f"CONTROL {datetime.now(TZ).isoformat(timespec='seconds')} {p['name']} "
-              f"{f'[{who}] ' if internal else ''}{json.dumps(diff)}", flush=True)
+              f"[{src}{f': {by}' if by else ''}] {json.dumps(diff)}", flush=True)
         await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": APPLY_TOPIC}))
         await ws.send(json.dumps({"command_type": APPLY_TOPIC, "payload": payload}))
         ack = await ws_command_status(ws, eid, "apply-event", APPLY_TOPIC, 45.0)
@@ -907,6 +914,9 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             result["note"] = "Queued: the panel is offline; FieldNET will deliver it when it reconnects."
         elif ack_status != "successful":
             result["note"] = "Sent, but no final acknowledgement from the panel within 45 s; check status with poll=true."
+        if PIVOT_LOG:
+            await PIVOT_LOG.record_command(pivot_id=eid, pivot_name=p["name"], source=src, who=by or None, diff=diff,
+                                           after=after, ack=ack_status, plan_name=plan, angle=status.get("current_angle"))
         try:
             fresh = await live_status(ws, eid, timeout=8.0)
             result["now"] = _describe(fresh)
@@ -1030,7 +1040,7 @@ async def _watcher_start(m: "_watcher.Member") -> dict[str, Any]:
     if m.auto_reverse is not None:
         changes["auto_reverse_on"] = bool(m.auto_reverse)
     return await _apply(None, m.pivot_id, changes, confirm=True,
-                        speed_pct=m.speed_pct, depth_in=m.depth_in, internal=True)
+                        speed_pct=m.speed_pct, depth_in=m.depth_in, internal=True, source="pump-group", who=m.group)
 
 
 WATCHER = _watcher.from_env(_watcher_pivots, _watcher_start, TZ)
@@ -1071,7 +1081,7 @@ async def _engine_control(pivot_id: str, cmd: dict[str, Any], send: bool,
         changes["service_stop_angle"] = float(cmd["service_stop_deg"]) % 360
         changes["service_stop_repeat_on"] = False
     return await _apply(None, pivot_id, changes, confirm=True, poll=False, speed_pct=cmd.get("speed_pct"),
-                        depth_in=cmd.get("depth_in"), internal=True, send=send, verify=verify, who="program")
+                        depth_in=cmd.get("depth_in"), internal=True, send=send, verify=verify, source="program")
 
 
 async def _engine_notify() -> None:
@@ -1088,6 +1098,21 @@ async def _engine_notify() -> None:
 
 ENGINE = _engine.from_env(os.environ.get("PUMPGROUPS_DB_URL", ""), TZ, _watcher_pivots, _engine_observe,
                           _engine_plan, _engine_control, _engine_notify)
+
+
+# ---------------------------------------------------------------------------
+# Pivot log (on when PUMPGROUPS_DB_URL is set; PIVOT_LOG_ENABLED=0 switches it off; see pivotlog.py)
+# ---------------------------------------------------------------------------
+
+import pivotlog as _pivotlog  # noqa: E402
+
+
+async def _pivot_summaries() -> list[dict[str, Any]]:
+    """Every pivot in one FieldNET call (shared 30 s cache with the watcher and engine)."""
+    return [summarize_pivot(p) for p in await get_pivots(max_age_s=30)]
+
+
+PIVOT_LOG = _pivotlog.from_env(os.environ.get("PUMPGROUPS_DB_URL", ""), _pivot_summaries)
 
 
 # ---------------------------------------------------------------------------
@@ -1244,13 +1269,13 @@ app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
 app.add_middleware(BearerAuth)
 
-if WATCHER or ENGINE:
+if WATCHER or ENGINE or PIVOT_LOG:
     _mcp_lifespan = app.router.lifespan_context
 
     @contextlib.asynccontextmanager
     async def _lifespan(a):  # type: ignore[no-untyped-def]
         async with _mcp_lifespan(a) as state:
-            tasks = [asyncio.create_task(x.run_forever()) for x in (WATCHER, ENGINE) if x]
+            tasks = [asyncio.create_task(x.run_forever()) for x in (WATCHER, ENGINE, PIVOT_LOG) if x]
             try:
                 yield state
             finally:

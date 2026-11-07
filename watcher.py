@@ -68,6 +68,7 @@ class Member:
     speed_pct: float | None = None
     depth_in: float | None = None
     auto_reverse: bool | None = None  # fallbacks: True/False sets it on start; None keeps the panel's setting
+    group: str = ""  # the group's name, for the pivot log
 
 
 @dataclass
@@ -315,7 +316,7 @@ class Watcher:
                 id=g["id"], name=g["name"], mode=g["mode"],
                 windows=[(w["start_dow"], w["start_min"], w["end_dow"], w["end_min"]) for w in wins if w["group_id"] == g["id"]],
                 members=[Member(m["pivot_id"], m["pivot_name"], m["role"], m["fallback_order"], m["direction"],
-                                _r(m["speed_pct"], 1), _r(m["depth_in"], 2), m["auto_reverse"])
+                                _r(m["speed_pct"], 1), _r(m["depth_in"], 2), m["auto_reverse"], g["name"])
                          for m in mems if m["group_id"] == g["id"]],
             ))
         return out
