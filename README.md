@@ -56,6 +56,7 @@ Environment tab to the one you want (the GUID in the FieldNET URL after
 | `daily_report` | Hours run and acres per day |
 | `irrigation_overview` | Hours / acres / volume / depth per pivot over a range |
 | `pivot_history` | Raw controller telemetry for the last N hours |
+| `pivot_raw` | Everything FieldNET says about one pivot, unprocessed (controller record, live panel status, a few related paths). For working out settings this server doesn't handle yet, like the end gun |
 
 ## Even-up planner
 
@@ -98,6 +99,18 @@ The dashboard's Irrigation pages read two more, also with the read key, both rea
 
 Both take a name or an id, and answer 404 for an unknown pivot and 502 for FieldNET trouble.
 
+**Dashboard controls** (the Irrigation pages' change sheet): `POST /api/pivots/{id}/control`.
+- **Keys:** it needs the read key *and* `X-Control-Key` set to `PORTAL_CONTROL_KEY`. That's a
+  separate key, so the dashboard's control can be switched off or rotated without touching the
+  Claude connector. Without `PORTAL_CONTROL_KEY` set, the endpoint answers 503.
+- **Body:** `{who, changes: {direction, water_on, speed_pct | depth_in | hours, service_stop_deg |
+  clear_service_stop, service_stop_repeat, auto_reverse, accessory_1}, confirm, preview_token}`.
+- **Two steps, like the connector's control tools:**
+  - Without `confirm`, it polls the panel and returns a preview and its token, and sends nothing.
+  - With `confirm=true` and the token, it sends the one full-panel command. If the panel's
+    settings changed in between, it sends nothing and returns a fresh preview.
+- **Logged** in the pivot log as the person (`source = portal`, `who`).
+
 The logic is pure and lives in `programs.py` (no FieldNET, no database); `python test_programs.py`
 runs its tests, including the real W-26 case from Nov 2026 and the safety rules over 400
 random fields; `python test_api.py` (with the requirements installed) tests the endpoint.
@@ -134,7 +147,13 @@ Every applied command is logged in Render's Logs as `CONTROL <time> <pivot> <dif
 Commands are sent exactly the way the web app's dashboard sends them
 (`pivot-control-dashboard-apply` over the WebSocket) and the server waits for
 the acknowledgement. Endgun enable/disable is not included (it lives in the
-endgun tables, a different flow).
+endgun tables, a different flow; `pivot_raw` shows what FieldNET has for it).
+
+**Chemigation (accessory 1).** On this farm aux 1 runs the chemical pumps, so it only runs
+with the pivot running wet:
+- asking for it on a stopped or dry pivot is refused;
+- any command that leaves the pivot stopped or dry, programs' included, turns it off, and the
+  preview says so.
 
 ## Fresh readings (polling)
 

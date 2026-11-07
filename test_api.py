@@ -225,6 +225,176 @@ def test_pivot_live_and_applied():
     assert client.get("/api/pivots/W-26/applied?from=yesterday", headers=KEY).status_code == 400
 
 
+def _control_fakes(live_overrides=None):
+    """FieldNET faked for control commands: a stopped W-26 with water set on. Returns (sent payloads, records)."""
+    import pivotlog
+
+    fake_fieldnet()
+    sent, recorded, polls = [], [], []
+
+    class Store:
+        async def add_command(self, *a):
+            recorded.append(a)
+            return 1
+
+        async def program_name(self, pivot_id):
+            return None
+
+    class WS(_WS):
+        async def send(self, m):
+            import json as _json
+            msg = _json.loads(m)
+            if msg.get("command_type") == server.APPLY_TOPIC:
+                sent.append(msg["payload"])
+
+    async def ws():
+        return WS()
+
+    state = {"operational_status": "stopped", "direction_key": "stopped", "water_on": True, "current_angle": 152.2,
+             "rate": 0.4, "rate_conversion_factor": 0.1417 / server.IN_PER_M, "full_run_time": 10.05 * 3600,
+             "service_stop": None, "service_stop_repeat_on": False, "current_plan_id": "manual-mode",
+             "auto_reverse_on": False, "auto_restart_on": False, "accessory_1_on": False, "rtu_online": True,
+             **(live_overrides or {})}
+
+    async def live(ws, eid, timeout=10.0):
+        return dict(state)
+
+    async def poll(ws, eid, timeout=45.0):
+        polls.append(eid)
+        return {"status": "successful", "fresh": True}
+
+    async def ack(ws, eid, kind, topic, timeout):
+        return {"status": "successful"}
+
+    saved = (server.ws_session, server.live_status, server.ws_command_status, server.ws_poll, server.PIVOT_LOG,
+             server.PORTAL_CONTROL_KEY)
+    server.ws_session, server.live_status, server.ws_command_status, server.ws_poll = ws, live, ack, poll
+    server.PIVOT_LOG = pivotlog.PivotLog(Store(), server._pivot_summaries)
+    server.PORTAL_CONTROL_KEY = "control-key"
+
+    def restore():
+        (server.ws_session, server.live_status, server.ws_command_status, server.ws_poll, server.PIVOT_LOG,
+         server.PORTAL_CONTROL_KEY) = saved
+
+    return sent, recorded, polls, restore
+
+
+CONTROL = {**KEY, "X-Control-Key": "control-key"}
+
+
+def test_dashboard_control_needs_both_keys():
+    sent, recorded, polls, restore = _control_fakes()
+    try:
+        body = {"who": "Sam Crew", "changes": {"direction": "forward"}}
+        assert client.post("/api/pivots/W-26/control", json=body).status_code == 401  # no read key
+        assert client.post("/api/pivots/W-26/control", json=body, headers=KEY).status_code == 403
+        assert client.post("/api/pivots/W-26/control", json=body, headers={**KEY, "X-Control-Key": "nope"}).status_code == 403
+        server.PORTAL_CONTROL_KEY = ""
+        assert client.post("/api/pivots/W-26/control", json=body, headers=CONTROL).status_code == 503
+    finally:
+        restore()
+    assert not sent
+
+
+def test_dashboard_control_checks_its_input():
+    sent, recorded, polls, restore = _control_fakes()
+    try:
+        bad = [{"changes": {"direction": "forward"}},  # nobody
+               {"who": "Sam", "changes": {}},
+               {"who": "Sam", "changes": {"direction": "sideways"}},
+               {"who": "Sam", "changes": {"speed_pct": 150}},
+               {"who": "Sam", "changes": {"speed_pct": 50, "depth_in": 0.5}},
+               {"who": "Sam", "changes": {"water_on": "yes"}},
+               {"who": "Sam", "changes": {"service_stop_deg": 400}}]
+        for b in bad:
+            r = client.post("/api/pivots/W-26/control", json=b, headers=CONTROL)
+            assert r.status_code == 400, (b, r.text)
+        assert client.post("/api/pivots/W-99/control", json={"who": "Sam", "changes": {"direction": "forward"}},
+                           headers=CONTROL).status_code == 404
+    finally:
+        restore()
+    assert not sent
+
+
+def test_dashboard_control_previews_then_sends_as_the_person():
+    sent, recorded, polls, restore = _control_fakes()
+    try:
+        body = {"who": "Sam Crew", "changes": {"direction": "forward", "depth_in": 0.45, "service_stop_deg": 150.6}}
+        r = client.post("/api/pivots/W-26/control", json=body, headers=CONTROL)
+        assert r.status_code == 200, r.text
+        prev = r.json()
+        assert prev["preview"] and prev["preview_token"] and "next_step" not in prev
+        assert prev["pivot_will"] == "RUN FORWARD, water ON" and polls == ["c6f28e12"] and not sent
+        assert prev["would_change"]["direction_key"] == {"from": "stopped", "to": "forward"}
+        # A wrong token sends nothing and comes back as a fresh preview.
+        r = client.post("/api/pivots/W-26/control", json={**body, "confirm": True, "preview_token": "stale"}, headers=CONTROL)
+        assert r.json().get("preview") and not sent
+        r = client.post("/api/pivots/W-26/control", json={**body, "confirm": True, "preview_token": prev["preview_token"]},
+                        headers=CONTROL)
+        res = r.json()
+        assert res["applied"] and res["panel_ack"] == "successful" and len(sent) == 1, res
+        assert sent[0]["direction_key"] == "forward" and sent[0]["service_stop_angle"] == 150.6
+        assert polls == ["c6f28e12"]  # confirming doesn't poll again
+        assert recorded[-1][2:4] == ("portal", "Sam Crew") and recorded[-1][7] == "taken"
+    finally:
+        restore()
+
+
+def test_chemigation_only_runs_wet():
+    import asyncio
+
+    # Asking for aux 1 on a stopped pivot is refused.
+    sent, recorded, polls, restore = _control_fakes()
+    try:
+        r = client.post("/api/pivots/W-26/control", json={"who": "Sam", "changes": {"accessory_1": True}}, headers=CONTROL)
+        assert r.status_code == 200 and r.json()["applied"] is False and "aux 1" in r.json()["error"]
+        # With a start wet in the same command it's fine.
+        r = client.post("/api/pivots/W-26/control", json={"who": "Sam", "changes": {"accessory_1": True, "direction": "forward",
+                                                                                    "water_on": True}}, headers=CONTROL)
+        assert r.json().get("preview_token") and "error" not in r.json()
+    finally:
+        restore()
+    # Stopping (or going dry) with the chemical pumps on turns them off too, and says so.
+    sent, recorded, polls, restore = _control_fakes({"operational_status": "forward-wet", "direction_key": "forward",
+                                                     "accessory_1_on": True})
+    try:
+        res = asyncio.run(server._apply(None, "W-26", {"direction_key": "stopped"}, confirm=True, poll=False,
+                                        internal=True, source="program"))
+        assert res["applied"] and sent[-1]["aux_1_on"] is False and res["changed"]["accessory_1"] == {"from": True, "to": False}
+        assert any("Chemigation" in n for n in res["notes"])
+        res = asyncio.run(server._apply(None, "W-26", {"water_on": False}, confirm=True, poll=False, internal=True,
+                                        source="program"))
+        assert sent[-1]["aux_1_on"] is False and sent[-1]["direction_key"] == "forward"
+    finally:
+        restore()
+
+
+def test_pivot_raw_reports_everything_and_survives_missing_paths():
+    import asyncio
+
+    import httpx
+
+    sent, recorded, polls, restore = _control_fakes()
+    real_get = server.api_get
+
+    async def api_get(path, params=None):
+        if path.endswith("/end-guns"):
+            return [{"id": "eg1", "enabled": True, "areas": [{"start": 10, "end": 80}]}]
+        req = httpx.Request("GET", "https://example.test" + path)
+        raise httpx.HTTPStatusError("nope", request=req, response=httpx.Response(404, request=req, text="not found"))
+
+    server.api_get = api_get
+    try:
+        out = asyncio.run(server.pivot_raw("W-26"))
+    finally:
+        server.api_get = real_get
+        restore()
+    assert out["controller"]["name"] == "W-26" and out["live"]["accessory_1_on"] is False
+    paths = out["paths"]
+    assert paths["/irrigation-controllers/c6f28e12/end-guns"]["status"] == 200
+    assert paths["/irrigation-controllers/c6f28e12/endguns"]["status"] == 404
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):

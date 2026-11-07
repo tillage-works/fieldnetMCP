@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import math
 import os
 import time
@@ -57,6 +58,9 @@ MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 # Optional. When set, the control tools below are enabled, and only for requests
 # that present THIS key (not the read-only key). Leave unset for a read-only server.
 MCP_WRITE_TOKEN = os.environ.get("MCP_WRITE_TOKEN", "")
+# The Hyer Farms dashboard's Irrigation controls (POST /api/pivots/{id}/control). Separate from the
+# connector's write key so the dashboard's control can be switched off or rotated on its own.
+PORTAL_CONTROL_KEY = os.environ.get("PORTAL_CONTROL_KEY", "")
 TZ = ZoneInfo(os.environ.get("FIELDNET_TZ", "America/Los_Angeles"))
 WS_URL = os.environ.get("FIELDNET_WS_URL", "wss://v2.api.myfieldnet.com/websocket")
 
@@ -621,7 +625,72 @@ async def pivot_history(pivot: str, hours: int = 48) -> dict[str, Any]:
 # and does nothing until called again with confirm=true; every applied command
 # is logged.
 
+async def _raw_get(path: str) -> dict[str, Any]:
+    """GET a FieldNET path and report what came back, errors included (for pivot_raw's look-arounds)."""
+    try:
+        body = await api_get(path)
+        text = json.dumps(body, default=str)
+        return {"status": 200, "body": body if len(text) <= 20_000 else text[:20_000] + "…"}
+    except httpx.HTTPStatusError as e:
+        return {"status": e.response.status_code, "body": e.response.text[:500]}
+    except Exception as e:  # noqa: BLE001
+        return {"status": None, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+async def pivot_raw(pivot: str) -> dict[str, Any]:
+    """Everything FieldNET says about one pivot, unprocessed: its record in the controller list, its live
+    panel status, and what a few related FieldNET paths answer. Read only. For working out settings this
+    server doesn't handle yet (e.g. how the end gun is switched)."""
+    p = await resolve_pivot(pivot)
+    eid = p["id"]
+    out: dict[str, Any] = {"pivot": p.get("name"), "controller": p}
+    try:
+        ws = await ws_session()
+        try:
+            out["live"] = await live_status(ws, eid)
+        finally:
+            await ws.close()
+    except Exception as e:  # noqa: BLE001
+        out["live_error"] = f"{type(e).__name__}: {e}"
+    paths = [f"/irrigation-controllers/{eid}", f"/irrigation-controllers/{eid}/end-guns",
+             f"/irrigation-controllers/{eid}/endguns", f"/irrigation-controllers/{eid}/end-gun-areas",
+             f"/irrigation-controllers/{eid}/settings", f"/irrigation-controllers/{eid}/configuration"]
+    out["paths"] = {path: await _raw_get(path) for path in paths}
+    return out
+
+
 DIRECTION_KEYS = ("forward", "reverse", "stopped")
+
+
+def _control_changes(direction: str | None = None, water_on: bool | None = None,
+                     service_stop_deg: float | None = None, clear_service_stop: bool = False,
+                     service_stop_repeat: bool | None = None, auto_reverse: bool | None = None,
+                     auto_restart: bool | None = None, accessory_1: bool | None = None) -> dict[str, Any]:
+    """Panel payload changes from control arguments (pivot_control and the dashboard's endpoint)."""
+    ch: dict[str, Any] = {}
+    if direction is not None:
+        d = str(direction).strip().lower()
+        if d not in DIRECTION_KEYS:
+            raise ValueError("direction must be 'forward', 'reverse' or 'stopped'")
+        ch["direction_key"] = d
+    if water_on is not None:
+        ch["water_on"] = bool(water_on)
+    if clear_service_stop and service_stop_deg is not None:
+        raise ValueError("Give service_stop_deg or clear_service_stop, not both.")
+    if clear_service_stop:
+        ch["service_stop_angle"] = None
+    elif service_stop_deg is not None:
+        ch["service_stop_angle"] = float(service_stop_deg) % 360
+    if service_stop_repeat is not None:
+        ch["service_stop_repeat_on"] = bool(service_stop_repeat)
+    if auto_reverse is not None:
+        ch["auto_reverse_on"] = bool(auto_reverse)
+    if auto_restart is not None:
+        ch["auto_restart_on"] = bool(auto_restart)
+    if accessory_1 is not None:
+        ch["aux_1_on"] = bool(accessory_1)
+    return ch
 IN_PER_M = 39.3701
 
 
@@ -812,7 +881,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
                  speed_pct: float | None = None, depth_in: float | None = None, hours: float | None = None,
                  plan: str | None = None, internal: bool = False, send: bool = True,
                  verify: "Callable[[dict[str, Any]], str | None] | None" = None,
-                 source: str | None = None, who: str = "") -> dict[str, Any]:
+                 source: str | None = None, who: str = "", authorized: bool = False) -> dict[str, Any]:
     """Build ONE complete control-panel payload and (on confirm) send it once.
 
     FieldNET applies the whole panel at once, so every field is sent every
@@ -827,12 +896,19 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
     sends nothing (practice). verify(final_settings) returns a reason when what
     FieldNET would apply doesn't match what was meant; then nothing is sent.
 
+    authorized=True is for the dashboard's control endpoint (api_pivot_control): it
+    checked the dashboard's key itself, and keeps the preview/confirm step.
+
+    Chemigation (aux 1, the chemical pumps) only runs with the pivot running wet:
+    asking for it otherwise is refused, and a command that leaves the pivot stopped
+    or dry turns it off (the preview says so).
+
     Every command sent is written to the pivot log (pivotlog.py) with its source:
     'pump-group' (who = the group), 'program' (the program's name is looked up),
     'portal' (who = the person) or, for the FieldNET Control connector, 'claude'."""
     src = source or ("pump-group" if internal else "claude")
-    by = who if internal else "Claude"
-    if not internal:
+    by = who if (internal or authorized) else "Claude"
+    if not internal and not authorized:
         _require_write(ctx)
     p = await resolve_pivot(pivot)
     eid = p["id"]
@@ -861,6 +937,13 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
         }
         before = _describe(dict(status, direction_key=eff_dir))
         payload.update(changes)
+        notes: list[str] = []
+        if payload.get("aux_1_on") and not (payload["direction_key"] in MOVING_PREFIXES and payload["water_on"]):
+            if changes.get("aux_1_on"):
+                return {"pivot": p["name"], "applied": False, "current": before,
+                        "error": "Chemigation (aux 1) can only be on while the pivot runs wet."}
+            payload["aux_1_on"] = False
+            notes.append("Chemigation (aux 1) turns off: the pivot won't be running wet.")
         after_status = dict(status, **{
             "direction_key": payload["direction_key"], "water_on": payload["water_on"], "rate": payload["rate"],
             "service_stop": payload["service_stop_angle"], "service_stop_repeat_on": payload["service_stop_repeat_on"],
@@ -877,6 +960,7 @@ async def _apply(ctx: Context | None, pivot: str, changes: dict[str, Any], confi
             "pivot_will": (f"RUN {payload['direction_key'].upper()}, water {'ON' if payload['water_on'] else 'OFF'}"
                            if will_move else "BE STOPPED"),
             "final_settings": after,
+            **({"notes": notes} if notes else {}),
         }
         if not status.get("rtu_online"):
             return {"pivot": p["name"], "applied": False, "error": "RTU is offline; command would not be delivered.", "current": before}
@@ -975,28 +1059,8 @@ if MCP_WRITE_TOKEN:
         Unspecified settings are kept. First call returns a preview and a
         preview_token; after the user approves, call again with the same
         arguments plus confirm=true and that preview_token."""
-        ch: dict[str, Any] = {}
-        if direction is not None:
-            d = direction.strip().lower()
-            if d not in DIRECTION_KEYS:
-                raise ValueError("direction must be 'forward', 'reverse' or 'stopped'")
-            ch["direction_key"] = d
-        if water_on is not None:
-            ch["water_on"] = bool(water_on)
-        if clear_service_stop and service_stop_deg is not None:
-            raise ValueError("Give service_stop_deg or clear_service_stop, not both.")
-        if clear_service_stop:
-            ch["service_stop_angle"] = None
-        elif service_stop_deg is not None:
-            ch["service_stop_angle"] = float(service_stop_deg) % 360
-        if service_stop_repeat is not None:
-            ch["service_stop_repeat_on"] = bool(service_stop_repeat)
-        if auto_reverse is not None:
-            ch["auto_reverse_on"] = bool(auto_reverse)
-        if auto_restart is not None:
-            ch["auto_restart_on"] = bool(auto_restart)
-        if accessory_1 is not None:
-            ch["aux_1_on"] = bool(accessory_1)
+        ch = _control_changes(direction, water_on, service_stop_deg, clear_service_stop, service_stop_repeat,
+                              auto_reverse, auto_restart, accessory_1)
         if not ch and plan is None and all(v is None for v in (speed_pct, depth_in, hours)):
             raise ValueError("No changes given.")
         return await _apply(ctx, pivot, ch, confirm, preview_token,
@@ -1224,7 +1288,7 @@ async def api_pivot_live(request: Request):
     settings["last_commanded_direction"] = status.get("direction_key")
     return JSONResponse({"pivot": {"id": p["id"], "name": p.get("name")}, "fresh": fresh,
                          "read_at": datetime.now(TZ).isoformat(timespec="seconds"), "settings": settings,
-                         "panel": status})
+                         "panel": status, "controller": p}, headers={"Cache-Control": "no-store"})
 
 
 async def api_pivot_applied(request: Request):
@@ -1255,6 +1319,81 @@ async def api_pivot_applied(request: Request):
                          "to": end.isoformat(), "covered_pct": round(covered / 3.6, 1), "wedges": wedges})
 
 
+def _num_in(v: Any, lo: float, hi: float, name: str) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= float(v) <= hi):
+        raise ValueError(f"{name} must be a number from {lo:g} to {hi:g}.")
+    return float(v)
+
+
+def _bool_or_none(v: Any, name: str) -> bool | None:
+    if v is None or isinstance(v, bool):
+        return v
+    raise ValueError(f"{name} must be true or false.")
+
+
+async def api_pivot_control(request: Request):
+    """POST /api/pivots/{id}/control: the dashboard's Irrigation controls, one full-panel command at a time.
+    Needs the read key (X-API-Key) and the dashboard's control key (X-Control-Key = PORTAL_CONTROL_KEY).
+    Body: {who: "<person>", changes: {direction, water_on, speed_pct | depth_in | hours, service_stop_deg |
+    clear_service_stop, service_stop_repeat, auto_reverse, accessory_1}, confirm, preview_token}.
+      * Without confirm: asks the panel for a fresh report, then returns the preview and its preview_token.
+        Sends nothing.
+      * With confirm=true and that token: sends the command (unless the panel's settings changed since the
+        preview: then a fresh preview comes back instead) and writes it to the pivot log as the person's.
+    → 200 the preview or the result · 400 bad input · 401/403 keys · 404 no such pivot · 502 FieldNET trouble ·
+      503 dashboard control not switched on"""
+    if not PORTAL_CONTROL_KEY:
+        return JSONResponse({"error": "Control from the dashboard isn't switched on here (PORTAL_CONTROL_KEY)."},
+                            status_code=503)
+    if not hmac.compare_digest(request.headers.get("x-control-key", "").encode(), PORTAL_CONTROL_KEY.encode()):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "Send a JSON body."}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("changes", {}), dict):
+        return JSONResponse({"error": "Send {who, changes}."}, status_code=400)
+    who = str(body.get("who") or "").strip()[:80]
+    if not who:
+        return JSONResponse({"error": "Say who is making the change (who)."}, status_code=400)
+    c = body.get("changes") or {}
+    try:
+        speed = _num_in(c.get("speed_pct"), 1, 100, "speed_pct")
+        depth = _num_in(c.get("depth_in"), 0.01, 5, "depth_in")
+        hours = _num_in(c.get("hours"), 1, 1000, "hours")
+        if sum(v is not None for v in (speed, depth, hours)) > 1:
+            raise ValueError("Give only one of speed_pct, depth_in or hours.")
+        stop = _num_in(c.get("service_stop_deg"), 0, 360, "service_stop_deg")
+        changes = _control_changes(
+            direction=c.get("direction"), water_on=_bool_or_none(c.get("water_on"), "water_on"),
+            service_stop_deg=stop, clear_service_stop=bool(_bool_or_none(c.get("clear_service_stop"), "clear_service_stop")),
+            service_stop_repeat=_bool_or_none(c.get("service_stop_repeat"), "service_stop_repeat"),
+            auto_reverse=_bool_or_none(c.get("auto_reverse"), "auto_reverse"),
+            accessory_1=_bool_or_none(c.get("accessory_1"), "accessory_1"))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not changes and all(v is None for v in (speed, depth, hours)):
+        return JSONResponse({"error": "No changes given."}, status_code=400)
+    try:
+        await resolve_pivot(request.path_params["pivot_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    confirm = body.get("confirm") is True
+    try:
+        res = await _apply(None, request.path_params["pivot_id"], changes, confirm, body.get("preview_token"),
+                           poll=not confirm, speed_pct=speed, depth_in=depth, hours=hours,
+                           authorized=True, source="portal", who=who)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:  # noqa: BLE001
+        print(f"CONTROL error (dashboard, {who}): {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't reach the panel through FieldNET right now."}, status_code=502)
+    res.pop("next_step", None)  # meant for Claude
+    return JSONResponse(res)
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1267,6 +1406,7 @@ app.add_route("/health", health, methods=["GET"])
 app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
 app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
+app.add_route("/api/pivots/{pivot_id}/control", api_pivot_control, methods=["POST"])
 app.add_middleware(BearerAuth)
 
 if WATCHER or ENGINE or PIVOT_LOG:
