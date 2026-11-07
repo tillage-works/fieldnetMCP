@@ -688,6 +688,23 @@ def _focus(js: str, file: str, room: int = 1800, limit: int = 12) -> list[dict[s
     return out
 
 
+_MODEL = re.compile(r"""(?:mn|y)\(["']custom_endgun_tables["']""")
+_WIRE = re.compile(r"""command_type""")
+
+
+def _around(js: str, file: str, pattern: re.Pattern, before: int, after: int, limit: int) -> list[dict[str, Any]]:
+    """Snippets with `before`/`after` characters around each match (for model and wire-format definitions)."""
+    out: list[dict[str, Any]] = []
+    for m in pattern.finditer(js):
+        if out and m.start() < out[-1]["from"] + len(out[-1]["text"]):
+            continue
+        start = max(0, m.start() - before)
+        out.append({"file": file, "from": start, "text": js[start:m.end() + after]})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _mentions(js: str, file: str, room: int = 220) -> list[dict[str, Any]]:
     """Snippets around each end gun mention, merged when they overlap."""
     out: list[dict[str, Any]] = []
@@ -707,7 +724,7 @@ async def _app_code_mentions(max_files: int = 250, max_hits: int = 80, max_bytes
     read, so an empty result can be told apart from a search that never reached the right code."""
     if _app_code["out"] is not None and time.time() - _app_code["at"] < 6 * 3600:
         return _app_code["out"]
-    out: dict[str, Any] = {"pages": {}, "files": [], "focus": [], "hits": [], "missing": 0}
+    out: dict[str, Any] = {"pages": {}, "files": [], "focus": [], "models": [], "wire": [], "hits": [], "missing": 0}
     read_bytes = 0
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 fieldnet-mcp"}) as c:
         for url in APP_URLS:
@@ -739,12 +756,18 @@ async def _app_code_mentions(max_files: int = 250, max_hits: int = 80, max_bytes
                 out["files"].append({"url": f, "bytes": len(js), "hits": len(hits)})
                 out["hits"].extend(hits)
                 out["focus"].extend(_focus(js, f))
+                # The end gun apply form's field list (it's defined just before custom_endgun_tables) and how
+                # the app wraps websocket commands.
+                out["models"].extend(_around(js, f, _MODEL, 3500, 400, 6))
+                out["wire"].extend(_around(js, f, _WIRE, 700, 500, 6))
                 queue.extend(u for u in _script_urls(js, f, root) if u not in seen)
             if out["files"]:
                 break
     out["hits_total"] = len(out["hits"])
     out["hits"] = out["hits"][:max_hits]
     out["focus"] = out["focus"][:24]
+    out["models"] = out["models"][:6]
+    out["wire"] = out["wire"][:6]
     out["bytes_read"] = read_bytes
     _app_code.update(at=time.time(), out=out)
     return out
@@ -763,6 +786,14 @@ async def pivot_raw(pivot: str) -> dict[str, Any]:
         ws = await ws_session()
         try:
             out["live"] = await live_status(ws, eid)
+            # The end gun status FieldNET's app builds its endgun-apply from (subscribe only; nothing sent to the panel).
+            try:
+                await ws.send(json.dumps({"command_type": "subscribe", "id": eid, "event_type": "endgun-status"}))
+                msg = await ws_wait(ws, lambda m: m.get("event_type") == "endgun-status"
+                                    and ((m.get("payload") or {}).get("id") in (eid, None)), 8.0)
+                out["endgun_status"] = msg["payload"] if msg else None
+            except Exception as e:  # noqa: BLE001
+                out["endgun_status_error"] = f"{type(e).__name__}: {e}"
         finally:
             await ws.close()
     except Exception as e:  # noqa: BLE001
