@@ -440,6 +440,10 @@ def test_finding_end_gun_code():
            + 'this._ws.send({command_type:Ze.EndgunApply,payload:{equipment_id:n,endgun_number:i,enabled:r}})')
     f = server._focus(app, "f.js")
     assert len(f) == 1 and f[0]["match"] == ".EndgunApply" and "endgun_number:i,enabled:r" in f[0]["text"]
+    model = ('h([y("equipment_id")],l3.prototype,"EquipmentId");h([y("endgun_1_active_table")],l3.prototype,"ActiveTable1");'
+             'h([mn("custom_endgun_tables",s3)],l3.prototype,"CustomEndgunTables");')
+    got = server._around(model, "f.js", server._MODEL, 3500, 400, 6)
+    assert len(got) == 1 and 'y("equipment_id")' in got[0]["text"] and "endgun_1_active_table" in got[0]["text"]
 
 
 if __name__ == "__main__":
