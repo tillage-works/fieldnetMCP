@@ -647,6 +647,8 @@ _JS_PATH = re.compile(r"""["'`]((?:\.{1,2}/|/)?(?:[\w@.-]+/)*[\w@.-]+\.m?js)(?:\
 _WEBPACK_MAP = re.compile(r"""(?:["'`]([\w./-]*)["'`]\s*\+\s*)?\w+\s*\+\s*["'`]([.-])["'`]\s*\+\s*\{([^{}]{4,40000})\}\[\w+\]\s*\+\s*["'`]((?:\.chunk)?\.m?js)["'`]""")
 _PAIR = re.compile(r"""["']?([\w-]+)["']?\s*:\s*["']([0-9a-zA-Z_-]{5,})["']""")
 _MENTION = re.compile(r"end[-_ ]?guns?", re.I)
+# Where the app sends or handles its end gun commands (not the enum lines that only name them).
+_FOCUS = re.compile(r"""\.Endgun(?:Apply|Poll|Status)\b(?!\s*=)|(?<![=:])\s*["'`]endgun-(?:apply|poll|status)["'`]""")
 _app_code: dict[str, Any] = {"at": 0.0, "out": None}
 
 
@@ -673,6 +675,19 @@ def _script_urls(text: str, base: str, root: str | None = None) -> list[str]:
     return sorted(same, key=lambda u: 0 if re.search(r"gun", u.rsplit("/", 1)[-1], re.I) else 1)
 
 
+def _focus(js: str, file: str, room: int = 1800, limit: int = 12) -> list[dict[str, Any]]:
+    """Wide snippets around each place the app sends or handles an end gun command."""
+    out: list[dict[str, Any]] = []
+    for m in _FOCUS.finditer(js):
+        if out and m.start() < out[-1]["from"] + len(out[-1]["text"]) - room // 2:
+            continue  # inside the last snippet
+        start = max(0, m.start() - room)
+        out.append({"file": file, "from": start, "match": m.group(0).strip(), "text": js[start:m.end() + room]})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _mentions(js: str, file: str, room: int = 220) -> list[dict[str, Any]]:
     """Snippets around each end gun mention, merged when they overlap."""
     out: list[dict[str, Any]] = []
@@ -692,7 +707,7 @@ async def _app_code_mentions(max_files: int = 250, max_hits: int = 80, max_bytes
     read, so an empty result can be told apart from a search that never reached the right code."""
     if _app_code["out"] is not None and time.time() - _app_code["at"] < 6 * 3600:
         return _app_code["out"]
-    out: dict[str, Any] = {"pages": {}, "files": [], "hits": [], "missing": 0}
+    out: dict[str, Any] = {"pages": {}, "files": [], "focus": [], "hits": [], "missing": 0}
     read_bytes = 0
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 fieldnet-mcp"}) as c:
         for url in APP_URLS:
@@ -706,7 +721,7 @@ async def _app_code_mentions(max_files: int = 250, max_hits: int = 80, max_bytes
                 continue
             root = str(r.url).split("#")[0]
             queue, seen = _script_urls(r.text, root, root), set()
-            while queue and len(out["files"]) < max_files and len(out["hits"]) < max_hits and read_bytes < max_bytes:
+            while queue and len(out["files"]) < max_files and read_bytes < max_bytes:
                 f = queue.pop(0)
                 if f in seen:
                     continue
@@ -723,10 +738,13 @@ async def _app_code_mentions(max_files: int = 250, max_hits: int = 80, max_bytes
                 hits = _mentions(js, f)
                 out["files"].append({"url": f, "bytes": len(js), "hits": len(hits)})
                 out["hits"].extend(hits)
+                out["focus"].extend(_focus(js, f))
                 queue.extend(u for u in _script_urls(js, f, root) if u not in seen)
             if out["files"]:
                 break
+    out["hits_total"] = len(out["hits"])
     out["hits"] = out["hits"][:max_hits]
+    out["focus"] = out["focus"][:24]
     out["bytes_read"] = read_bytes
     _app_code.update(at=time.time(), out=out)
     return out
@@ -749,13 +767,11 @@ async def pivot_raw(pivot: str) -> dict[str, Any]:
             await ws.close()
     except Exception as e:  # noqa: BLE001
         out["live_error"] = f"{type(e).__name__}: {e}"
-    paths = [f"/irrigation-controllers/{eid}", f"/irrigation-controllers/{eid}/settings",
-             f"/irrigation-controllers/{eid}/endgun-tables", f"/irrigation-controllers/{eid}/end-gun-tables",
-             f"/endgun-tables?irrigation-controller-id={eid}"]
-    for key in ("endgun_1_table_id", "endgun_2_table_id"):
-        tid = (out.get("live") or {}).get(key)
+    paths = [f"/irrigation-controllers/{eid}", f"/irrigation-controllers/{eid}/settings"]
+    for n in (1, 2):  # FieldNET's app reads end gun tables at /irrigation-controllers/{id}/endguns/{n}/tables/{table}
+        tid = (out.get("live") or {}).get(f"endgun_{n}_table_id")
         if tid:
-            paths += [f"/endgun-tables/{tid}", f"/end-gun-tables/{tid}", f"/irrigation-controllers/{eid}/endgun-tables/{tid}"]
+            paths.append(f"/irrigation-controllers/{eid}/endguns/{n}/tables/{tid}")
     out["paths"] = {path: await _raw_get(path) for path in dict.fromkeys(paths)}
     try:
         out["app_code"] = await _app_code_mentions()

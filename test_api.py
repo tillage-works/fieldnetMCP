@@ -395,7 +395,7 @@ def test_pivot_raw_reports_everything_and_survives_missing_paths():
         restore()
     assert out["controller"]["name"] == "W-26" and out["live"]["accessory_1_on"] is False
     paths = out["paths"]
-    assert paths["/irrigation-controllers/c6f28e12/endgun-tables"]["status"] == 404
+    assert list(paths) == ["/irrigation-controllers/c6f28e12", "/irrigation-controllers/c6f28e12/settings"]
     assert "app_code" in out
 
 
@@ -435,6 +435,11 @@ def test_finding_end_gun_code():
     js = 'x' * 600 + 'fetch(`/irrigation-controllers/${id}/endgun-tables/${t}`,{method:"PUT",body:JSON.stringify({enabled:e})})' + "y" * 600 + 'endGun2'
     hits = server._mentions(js, "f.js")
     assert len(hits) == 2 and "endgun-tables" in hits[0]["text"] and "enabled" in hits[0]["text"]
+    # Where the app sends its end gun command, not the enum line that names it.
+    app = ('e.EndgunApply="endgun-apply",e.EndgunPoll="endgun-poll",' + "z" * 3000
+           + 'this._ws.send({command_type:Ze.EndgunApply,payload:{equipment_id:n,endgun_number:i,enabled:r}})')
+    f = server._focus(app, "f.js")
+    assert len(f) == 1 and f[0]["match"] == ".EndgunApply" and "endgun_number:i,enabled:r" in f[0]["text"]
 
 
 if __name__ == "__main__":
