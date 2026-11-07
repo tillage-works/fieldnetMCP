@@ -641,17 +641,36 @@ async def _raw_get(path: str) -> dict[str, Any]:
 # FieldNET's own web app, whose public code shows how it makes calls this server doesn't know yet.
 APP_URLS = ("https://app.myfieldnet.com/", "https://www.myfieldnet.com/", "https://myfieldnet.com/")
 _SCRIPT = re.compile(r"""<(?:script[^>]+src|link[^>]+href)=["']([^"']+\.js[^"']*)["']""", re.I)
-_CHUNK = re.compile(r"""["'`]((?:/?[\w.-]+/)*[\w.-]+\.[0-9a-f]{6,}(?:\.chunk)?\.js)["'`]""", re.I)
+# Any quoted path to a JavaScript file (Vite "assets/EndGuns-a1B2c3.js", Angular "chunk-ABCD1234.js", "./x.js"…)
+_JS_PATH = re.compile(r"""["'`]((?:\.{1,2}/|/)?(?:[\w@.-]+/)*[\w@.-]+\.m?js)(?:\?[^"'`]*)?["'`]""")
+# Webpack's chunk map: "static/js/" + e + "." + {12:"a1b2c3d4", …}[e] + ".chunk.js"
+_WEBPACK_MAP = re.compile(r"""(?:["'`]([\w./-]*)["'`]\s*\+\s*)?\w+\s*\+\s*["'`]([.-])["'`]\s*\+\s*\{([^{}]{4,40000})\}\[\w+\]\s*\+\s*["'`]((?:\.chunk)?\.m?js)["'`]""")
+_PAIR = re.compile(r"""["']?([\w-]+)["']?\s*:\s*["']([0-9a-zA-Z_-]{5,})["']""")
 _MENTION = re.compile(r"end[-_ ]?guns?", re.I)
 _app_code: dict[str, Any] = {"at": 0.0, "out": None}
 
 
-def _script_urls(text: str, base: str) -> list[str]:
-    """JavaScript files a page or bundle refers to (script tags, modulepreload links, hashed chunk names)."""
-    from urllib.parse import urljoin
+def _script_urls(text: str, base: str, root: str | None = None) -> list[str]:
+    """JavaScript files a page or bundle refers to, on the same site: script tags, module preloads, quoted .js
+    paths (tried against the file's folder and the site root) and webpack chunk maps. Names with "gun" in
+    them come first."""
+    from urllib.parse import urljoin, urlsplit
 
-    found = [urljoin(base, m) for m in _SCRIPT.findall(text)] + [urljoin(base, m) for m in _CHUNK.findall(text)]
-    return list(dict.fromkeys(u for u in found if u.startswith("http")))
+    root = root or urljoin(base, "/")
+    found = [urljoin(base, m) for m in _SCRIPT.findall(text)]
+    for m in _JS_PATH.findall(text):
+        found.append(urljoin(base, m))
+        if not m.startswith((".", "/")):
+            found.append(urljoin(root, m))
+    for m in _WEBPACK_MAP.finditer(text):
+        prefix, sep, body, suffix = m.groups()
+        for k, h in _PAIR.findall(body):
+            name = f"{prefix or ''}{k}{sep}{h}{suffix}"
+            found += [urljoin(root, name), urljoin(base, name)]
+    host = urlsplit(base).hostname or ""
+    same = [u.split("?")[0] for u in found if (urlsplit(u).hostname or "") == host]
+    same = list(dict.fromkeys(same))
+    return sorted(same, key=lambda u: 0 if re.search(r"gun", u.rsplit("/", 1)[-1], re.I) else 1)
 
 
 def _mentions(js: str, file: str, room: int = 220) -> list[dict[str, Any]]:
@@ -668,37 +687,47 @@ def _mentions(js: str, file: str, room: int = 220) -> list[dict[str, Any]]:
     return out
 
 
-async def _app_code_mentions(max_files: int = 80, max_hits: int = 80) -> dict[str, Any]:
-    """Search FieldNET's web app code for end gun calls. Cached for 6 hours; read only."""
+async def _app_code_mentions(max_files: int = 250, max_hits: int = 80, max_bytes: int = 80_000_000) -> dict[str, Any]:
+    """Search FieldNET's web app code for end gun calls. Cached for 6 hours; read only. Lists the files it
+    read, so an empty result can be told apart from a search that never reached the right code."""
     if _app_code["out"] is not None and time.time() - _app_code["at"] < 6 * 3600:
         return _app_code["out"]
-    out: dict[str, Any] = {"pages": {}, "files_read": 0, "hits": []}
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "fieldnet-mcp"}) as c:
+    out: dict[str, Any] = {"pages": {}, "files": [], "hits": [], "missing": 0}
+    read_bytes = 0
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 fieldnet-mcp"}) as c:
         for url in APP_URLS:
             try:
                 r = await c.get(url)
             except Exception as e:  # noqa: BLE001
                 out["pages"][url] = f"{type(e).__name__}: {e}"[:200]
                 continue
-            out["pages"][url] = r.status_code
+            out["pages"][url] = {"status": r.status_code, "final": str(r.url), "bytes": len(r.content)}
             if r.status_code != 200:
                 continue
-            queue, seen = _script_urls(r.text, str(r.url)), set()
-            while queue and out["files_read"] < max_files and len(out["hits"]) < max_hits:
+            root = str(r.url).split("#")[0]
+            queue, seen = _script_urls(r.text, root, root), set()
+            while queue and len(out["files"]) < max_files and len(out["hits"]) < max_hits and read_bytes < max_bytes:
                 f = queue.pop(0)
                 if f in seen:
                     continue
                 seen.add(f)
                 try:
-                    js = (await c.get(f)).text
+                    resp = await c.get(f)
                 except Exception:  # noqa: BLE001
                     continue
-                out["files_read"] += 1
-                out["hits"].extend(_mentions(js, f))
-                queue.extend(u for u in _script_urls(js, f) if u not in seen)
-            if out["files_read"]:
+                if resp.status_code != 200 or "html" in resp.headers.get("content-type", ""):
+                    out["missing"] += 1
+                    continue
+                js = resp.text
+                read_bytes += len(js)
+                hits = _mentions(js, f)
+                out["files"].append({"url": f, "bytes": len(js), "hits": len(hits)})
+                out["hits"].extend(hits)
+                queue.extend(u for u in _script_urls(js, f, root) if u not in seen)
+            if out["files"]:
                 break
     out["hits"] = out["hits"][:max_hits]
+    out["bytes_read"] = read_bytes
     _app_code.update(at=time.time(), out=out)
     return out
 

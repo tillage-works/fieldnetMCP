@@ -420,13 +420,21 @@ def test_raw_endpoint():
 
 
 def test_finding_end_gun_code():
-    html = '<html><script type="module" src="/assets/index.4f3a9b2c.js"></script><link rel="modulepreload" href="/assets/vendor.1234abcd.js"></html>'
-    assert server._script_urls(html, "https://app.example/") == ["https://app.example/assets/index.4f3a9b2c.js",
-                                                                 "https://app.example/assets/vendor.1234abcd.js"]
-    js = 'import("./EndGuns.9f8e7d6c.js");' + "x" * 600 + 'fetch(`/irrigation-controllers/${id}/endgun-tables/${t}`,{method:"PUT",body:JSON.stringify({enabled:e})})' + "y" * 600 + 'endGun2'
-    assert "https://app.example/assets/EndGuns.9f8e7d6c.js" in server._script_urls(js, "https://app.example/assets/index.4f3a9b2c.js")
+    page = "https://app.example/"
+    html = '<html><script type="module" src="/assets/index-4f3a9b2c.js"></script><link rel="modulepreload" href="/assets/vendor.1234abcd.js"><script src="https://maps.other.example/x.js"></script></html>'
+    assert server._script_urls(html, page) == ["https://app.example/assets/index-4f3a9b2c.js", "https://app.example/assets/vendor.1234abcd.js"]
+    # Vite and Angular lazy chunks; names with end/gun first.
+    vite = 'const a=()=>import("./Plans-Ab12Cd34.js"),b=()=>import("./EndGuns-Xy98Zw76.js");'
+    assert server._script_urls(vite, "https://app.example/assets/index-4f3a9b2c.js")[0] == "https://app.example/assets/EndGuns-Xy98Zw76.js"
+    ng = 'loadComponent:()=>import("./chunk-QWER1234.js").then(m=>m.X)'
+    assert "https://app.example/chunk-QWER1234.js" in server._script_urls(ng, "https://app.example/main-ABCD.js", page)
+    # A webpack chunk map, tried against the site root.
+    wp = 'n.u=function(e){return"static/js/"+e+"."+{12:"a1b2c3d4",345:"e5f6a7b8"}[e]+".chunk.js"}'
+    urls = server._script_urls(wp, "https://app.example/static/js/runtime-main.js", page)
+    assert "https://app.example/static/js/12.a1b2c3d4.chunk.js" in urls and "https://app.example/static/js/345.e5f6a7b8.chunk.js" in urls
+    js = 'x' * 600 + 'fetch(`/irrigation-controllers/${id}/endgun-tables/${t}`,{method:"PUT",body:JSON.stringify({enabled:e})})' + "y" * 600 + 'endGun2'
     hits = server._mentions(js, "f.js")
-    assert len(hits) == 3 and "endgun-tables" in hits[1]["text"] and "enabled" in hits[1]["text"]
+    assert len(hits) == 2 and "endgun-tables" in hits[0]["text"] and "enabled" in hits[0]["text"]
 
 
 if __name__ == "__main__":
