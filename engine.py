@@ -40,6 +40,17 @@ Rules (from the advanced irrigation programs brief, agreed with Andrew):
     PROGRAMS_ALLOW_LIVE=1 must also be set on the server for anything to be
     sent; without it every program runs as practice.
 
+Shuttles (settings.kind == "shuttle", stored as kind 'custom'): back and forth
+over a strip between two stops, for a number of passes or left on. Started
+from a pivot's Irrigation page, a shuttle starts the pivot itself straight
+away: the engine works it out from the pivot's position (programs.plan_shuttle)
+and sends pass 1. If the pivot isn't reporting or is in a fault then, the
+shuttle pauses rather than waiting (it must never start hours later on its
+own). Every pass ends at a stop and turns round on the move there, with that
+stop as its service stop; everything else above applies. Practice shuttles
+check pass 1 with FieldNET and end, since they can't follow a pivot they
+never start.
+
 Storage: the `pumpgroups` schema in AgHub Ops DB, shared with the dashboard
 (`npm run create-pumpgroups-db`): program, program_run and program_event.
 
@@ -302,6 +313,22 @@ def estimate_to_go(run: Run, obs_angle: float | None, now: float) -> float | Non
         p = progress(st, obs_angle)
         best = p if best is None else max(best, p)
     return None if best is None else st["arc_deg"] - best
+
+
+def is_shuttle(prog: Program) -> bool:
+    return (prog.settings or {}).get("kind") == "shuttle"
+
+
+def shuttle_start(p: dict[str, Any] | None, name: str) -> tuple[bool, str]:
+    """Can a shuttle start this pivot now? (True, why) or (False, why not). A shuttle never waits."""
+    if p is None:
+        return False, f"{name} isn't in FieldNET's list"
+    cls = classify(p)
+    if cls == "offline":
+        return False, f"{name} isn't reporting"
+    if cls in ("fault", "low-pressure"):
+        return False, f"{name} is in {p.get('operational_status') or 'a fault'}"
+    return True, "was started from the Irrigation page"
 
 
 def start_reason(prog: Program, p: dict[str, Any] | None, seen_idle: bool) -> str | None:
@@ -678,6 +705,16 @@ class Engine:
             by_id = {str(p.get("id")): p for p in await self.pivots()}
             for prog in armed:
                 p = by_id.get(prog.pivot_id)
+                if is_shuttle(prog):
+                    ok, why = shuttle_start(p, prog.pivot_name)
+                    if not ok:
+                        await self.store.set_program(prog.id, "paused", f"couldn't start: {why}")
+                        await self._log(prog, "start-failed", f"{prog.name} couldn't start: {why}. The shuttle is paused; "
+                                        "start it again when the pivot is ready.", alert=True)
+                        continue
+                    if await self.start(prog, why, p):
+                        wake = min(wake, 60.0)
+                    continue
                 if p is not None and classify(p) != "running-wet":
                     self.seen_idle.add(prog.id)
                 why = start_reason(prog, p, prog.id in self.seen_idle)
@@ -702,6 +739,11 @@ class Engine:
         except Exception as e:  # noqa: BLE001
             n = self.start_failures.get(prog.id, 0) + 1
             self.start_failures[prog.id] = n
+            if is_shuttle(prog):  # e.g. the pivot is off the strip: retrying won't help, and it must not start later
+                self.start_failures.pop(prog.id, None)
+                await self.store.set_program(prog.id, "paused", f"couldn't start: {e}")
+                await self._log(prog, "start-failed", f"{prog.name} couldn't start: {e} The shuttle is paused.", alert=True)
+                return None
             if n >= 3:
                 await self.store.set_program(prog.id, "paused", f"couldn't work out the plan: {e}")
                 await self._log(prog, "start-failed", f"{prog.pivot_name} {why}, but the plan couldn't be worked out "
@@ -717,7 +759,7 @@ class Engine:
             await self._log(prog, "nothing-to-do", f"{prog.pivot_name} {why}, but the field is already even "
                             "(nothing to do). The program is finished.", alert=True)
             return None
-        why_not = needs_reapproval(plan, prog.approved, float(prog.settings.get("maxDepthIn", 0.3)))
+        why_not = None if is_shuttle(prog) else needs_reapproval(plan, prog.approved, float(prog.settings.get("maxDepthIn", 0.3)))
         if why_not:
             await self.store.set_program(prog.id, "paused", f"needs a new approval: {why_not}")
             await self._log(prog, "needs-approval", f"{prog.pivot_name} {why}, but the plan worked out now is bigger than "
@@ -728,13 +770,24 @@ class Engine:
         if not run:
             return None
         self.seen_idle.discard(prog.id)
+        if is_shuttle(prog):
+            sh = plan.get("shuttle") or {}
+            how_many = "left on" if sh.get("leave_on") else f"{len(plan['steps'])} pass{'' if len(plan['steps']) == 1 else 'es'}"
+            summary = (f"back and forth between {fmt_deg(sh.get('from_deg'))} and {fmt_deg(sh.get('to_deg'))}, {how_many}"
+                       + ("" if sh.get("leave_on") else f", about {plan.get('total_hours', 0):.0f} h"))
+        else:
+            summary = (f"{len(plan['steps'])} step{'' if len(plan['steps']) == 1 else 's'}, about {plan.get('total_hours', 0):.0f} h, "
+                       f"spread {plan.get('spread_before_in', 0):.2f}\" → {plan.get('spread_after_in', 0):.2f}\"")
         await self._log(run, "started" if not practice else "practice-start",
-                        f"{prog.pivot_name} {why}. {'Practice run of' if practice else 'Running'} {prog.name}: "
-                        f"{len(plan['steps'])} step{'' if len(plan['steps']) == 1 else 's'}, about {plan.get('total_hours', 0):.0f} h, spread "
-                        f"{plan.get('spread_before_in', 0):.2f}\" → {plan.get('spread_after_in', 0):.2f}\".",
+                        f"{prog.pivot_name} {why}. {'Practice run of' if practice else 'Running'} {prog.name}: {summary}.",
                         alert=True, angle=(p or {}).get("pivot_angle"), detail={"plan": _plan_summary(plan)})
-        await self.send(run, 0, f"Step 1: {describe_step(plan['steps'][0])}.", "would-step" if practice else "step",
-                        (p or {}).get("pivot_angle"))
+        ok = await self.send(run, 0, f"Step 1: {describe_step(plan['steps'][0])}.", "would-step" if practice else "step",
+                             (p or {}).get("pivot_angle"))
+        if practice and is_shuttle(prog) and ok:
+            # Practice can't follow a pivot it never starts: pass 1 was checked with FieldNET; that's the practice.
+            await self.store.end_run(run, "practice", "finished", "practice run ended")
+            await self._log(run, "practice-done", f"Practice: {prog.name} was worked out and pass 1 checked with FieldNET; "
+                            "nothing was sent. Start it live to run it.", alert=True)
         return run
 
     async def send(self, run: Run, k: int, message: str, event: str, angle: float | None = None) -> bool:

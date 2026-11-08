@@ -1427,8 +1427,27 @@ async def _engine_observe(pivot_id: str, poll: bool) -> dict[str, Any]:
         await ws.close()
 
 
+async def _shuttle_plan(pivot_id: str, s: dict[str, Any], poll: bool = True) -> dict[str, Any]:
+    """A shuttle from the pivot's position now (asking the panel first when poll): programs.plan_shuttle."""
+    p = await resolve_pivot(pivot_id)
+    st = await _engine_observe(p["id"], poll)
+    rcf, frt, angle = st.get("rate_conversion_factor"), st.get("full_run_time"), st.get("current_angle")
+    if not rcf or not frt:
+        raise ValueError("This pivot has no depth calibration or full-circle time in FieldNET, so a shuttle can't be planned.")
+    if angle is None:
+        raise ValueError("FieldNET hasn't reported where the pivot is.")
+    plan = _programs.plan_shuttle(float(s["fromDeg"]), float(s["toDeg"]), float(angle), s.get("passes"),
+                                  bool(s.get("waterOn")), s.get("depthIn"), rcf * IN_PER_M, frt / 3600.0, s.get("first"))
+    plan["pivot"] = p.get("name")
+    plan["position_as_of"] = datetime.now(TZ).isoformat(timespec="seconds") if st.get("_fresh") else None
+    return plan
+
+
 async def _engine_plan(pivot_id: str, s: dict[str, Any]) -> dict[str, Any]:
-    """Work an even-up out again at start, with the settings the owner chose, up to today."""
+    """Work a program out again at start: a shuttle from the pivot's position now, or an even-up with the
+    settings the owner chose, up to today."""
+    if s.get("kind") == "shuttle":
+        return await _shuttle_plan(pivot_id, s, poll=True)
     return await plan_even_up(pivot_id, max_depth_per_pass_in=float(s["maxDepthIn"]), from_date=s.get("fromDate"),
                               to_date=None, target_in=s.get("targetIn"), tolerance_in=float(s.get("toleranceIn") or 0.05),
                               poll=True)
@@ -1755,6 +1774,55 @@ async def api_pivot_endgun(request: Request):
     return JSONResponse(res)
 
 
+def shuttle_settings(b: Any) -> dict[str, Any]:
+    """Check a shuttle's settings (the dashboard sends them to preview, and saves them with the program)."""
+    if not isinstance(b, dict):
+        raise ValueError("Send the shuttle's settings.")
+    out: dict[str, Any] = {"kind": "shuttle"}
+    for k in ("fromDeg", "toDeg"):
+        out[k] = _num_in(b.get(k), 0, 360, k)
+        if out[k] is None:
+            raise ValueError(f"{k} is needed.")
+    passes = b.get("passes")
+    if passes is not None and (isinstance(passes, bool) or not isinstance(passes, int) or not 1 <= passes <= 1000):
+        raise ValueError("passes must be 1 to 1000, or null to leave it on.")
+    out["passes"] = passes
+    out["waterOn"] = bool(_bool_or_none(b.get("waterOn"), "waterOn"))
+    out["depthIn"] = _num_in(b.get("depthIn"), 0.01, 5, "depthIn") if out["waterOn"] else None
+    if out["waterOn"] and out["depthIn"] is None:
+        raise ValueError("depthIn is needed for a wet shuttle.")
+    first = b.get("first")
+    if first not in (None, "forward", "reverse"):
+        raise ValueError("first must be forward or reverse.")
+    out["first"] = first
+    return out
+
+
+async def api_plan_shuttle(request: Request):
+    """POST /api/plan-shuttle (read key): work out a shuttle from the pivot's position now. Sends nothing.
+    Body: {pivot, fromDeg, toDeg, passes (null = leave on), waterOn, depthIn, first?, poll?}
+    → 200 the plan · 400 bad input · 404 no such pivot · 422 can't (off the strip…) · 502 FieldNET trouble"""
+    try:
+        body = await request.json()
+        settings = shuttle_settings(body)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "Send a JSON body."}, status_code=400)
+    try:
+        await resolve_pivot(str(body.get("pivot") or ""))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    try:
+        plan = await _shuttle_plan(str(body["pivot"]), settings, poll=body.get("poll") is not False)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=422)
+    except Exception as e:  # noqa: BLE001
+        print(f"SHUTTLE plan error: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't reach the panel through FieldNET right now."}, status_code=502)
+    return JSONResponse({**plan, "settings": settings})
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1765,6 +1833,7 @@ app.router.routes.append(_Route("/control/mcp", endpoint=_mcp_route.endpoint, me
 app.add_route("/", health, methods=["GET"])
 app.add_route("/health", health, methods=["GET"])
 app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
+app.add_route("/api/plan-shuttle", api_plan_shuttle, methods=["POST"])
 app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/control", api_pivot_control, methods=["POST"])

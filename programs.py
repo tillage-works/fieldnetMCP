@@ -398,4 +398,91 @@ def plan_even_up(wedges: list[Wedge], state: PivotState, profile: FieldProfile, 
             "spread_after_in": round(hi1 - lo1, 2), "wedges": wedge_table(added), "notes": notes}
 
 
-__all__ = ["Wedge", "FieldProfile", "PivotState", "plan_even_up", "DEFAULT_MAX_DEPTH_IN", "norm", "cw", "arc_contains", "degrees_to_go", "has_passed"]
+# ---------------------------------------------------------------------------
+# Shuttle: back and forth over a strip between two stops.
+# ---------------------------------------------------------------------------
+
+SHUTTLE_END_TOL_DEG = 2.0  # this close to a stop counts as at it
+SHUTTLE_HORIZON_H = 30 * 24.0  # "leave on" plans this far ahead (it stops at the last pass's service stop)
+SHUTTLE_MAX_PASSES = 1000
+
+
+def plan_shuttle(from_deg: float, to_deg: float, angle_deg: float, passes: int | None, water_on: bool,
+                 depth_in: float | None, depth_full_in: float, circle_hours_full: float,
+                 first: str | None = None) -> dict[str, Any]:
+    """Back and forth over the strip that runs FORWARD (clockwise) from from_deg to to_deg.
+
+    One pass = across the strip once: passes=1 goes to the other stop and stops there; 2 goes over
+    and back; None = "leave on" (keeps going, planned SHUTTLE_HORIZON_H ahead). The pivot must be on
+    the strip. The first pass heads for the farther stop unless `first` says which way; from the
+    middle of the strip it's a part pass. Every pass ends at a stop and turns round on the move
+    there, with the stop as its service stop (the engine's rules); the last one stops at it.
+    Wet passes run at depth_in (no less than the pivot puts on at full speed); dry ones at 100%."""
+    width = cw(from_deg, to_deg)
+    if width < 1.0:
+        raise ValueError("The two stops are the same angle: pick two different stops.")
+    if passes is not None and not (1 <= passes <= SHUTTLE_MAX_PASSES):
+        raise ValueError(f"Passes must be 1 to {SHUTTLE_MAX_PASSES}, or leave it on.")
+    if water_on:
+        if depth_in is None or depth_in <= 0:
+            raise ValueError("Say how much to put on per pass.")
+        if depth_in < depth_full_in - 0.005:
+            raise ValueError(f'{depth_in:.2f}" is less than this pivot puts on at full speed ({depth_full_in:.2f}").')
+    if circle_hours_full <= 0:
+        raise ValueError("This pivot has no full-circle time, so a shuttle can't be timed.")
+    if first not in (None, "forward", "reverse"):
+        raise ValueError("first must be forward or reverse.")
+    pos = cw(from_deg, angle_deg)  # how far along the strip, from the first stop going forward
+    if pos > 360.0 - SHUTTLE_END_TOL_DEG:
+        pos = 0.0
+    if pos > width + SHUTTLE_END_TOL_DEG:
+        raise ValueError(f"The pivot is at {norm(angle_deg):.1f}°, off the strip {norm(from_deg):.1f}° → {norm(to_deg):.1f}°. "
+                         "Park it at one of the stops first.")
+    pos = min(pos, width)
+    direction = first or ("forward" if width - pos >= pos else "reverse")
+    if (direction == "forward" and width - pos < 0.5) or (direction == "reverse" and pos < 0.5):
+        direction = "reverse" if direction == "forward" else "forward"  # already at that stop: the other way first
+    speed = 1.0 if not water_on else min(1.0, depth_full_in / float(depth_in))
+    hours_per_deg = circle_hours_full / 360.0 / speed
+    limit = passes or SHUTTLE_MAX_PASSES
+    steps: list[dict[str, Any]] = []
+    elapsed = 0.0
+    while len(steps) < limit:
+        target = width if direction == "forward" else 0.0
+        arc = abs(target - pos)
+        hours = arc * hours_per_deg
+        elapsed += hours
+        end = norm(from_deg + target)
+        steps.append({
+            "id": len(steps) + 1, "pass_no": len(steps) + 1, "direction": direction, "water_on": bool(water_on),
+            "depth_in": round(float(depth_in), 2) if water_on else None, "speed_pct": round(100.0 * speed, 1),
+            "start_deg": round(norm(from_deg + pos), 1), "end_deg": round(end, 1), "arc_deg": round(arc, 1),
+            "hours": round(hours, 2), "transition": "stop", "done_after_hours": round(elapsed, 2),
+            "service_stop_deg": round(end, 1),
+        })
+        pos, direction = target, ("reverse" if direction == "forward" else "forward")
+        if passes is None and elapsed >= SHUTTLE_HORIZON_H:
+            break
+    steps[-1]["transition"] = "end"
+    what = f'wet at {float(depth_in):.2f}" per pass' if water_on else "dry at 100%"
+    notes = [f"Back and forth over {width:.1f}° between {norm(from_deg):.1f}° and {norm(to_deg):.1f}°, {what}."]
+    if steps[0]["arc_deg"] < width - 0.5:
+        notes.append(f"It starts {norm(angle_deg):.1f}° along the strip, so pass 1 is a part pass.")
+    if passes is None:
+        notes.append(f"Left on: it keeps going (planned {len(steps)} passes, about {elapsed / 24:.0f} days ahead); "
+                     "stop it any time with Stop or by pausing the program.")
+    return {
+        "kind": "shuttle", "feasible": True, "pivot": "", "position_as_of": None,
+        "start": {"angle_deg": round(norm(angle_deg), 1), "direction": steps[0]["direction"]},
+        "shuttle": {"from_deg": round(norm(from_deg), 1), "to_deg": round(norm(to_deg), 1), "width_deg": round(width, 1),
+                    "passes": passes, "leave_on": passes is None, "water_on": bool(water_on),
+                    "depth_in": round(float(depth_in), 2) if water_on else None, "pass_hours": round(width * hours_per_deg, 2)},
+        "steps": steps, "passes": len(steps), "stops": 0, "total_hours": round(elapsed, 2),
+        "depth_at_full_speed_in": round(depth_full_in, 3), "max_depth_per_pass_in": round(float(depth_in), 2) if water_on else 0,
+        "target_in": 0, "tolerance_in": 0, "range_before_in": [0, 0], "spread_before_in": 0, "range_after_in": [0, 0],
+        "spread_after_in": 0, "wedges": [], "notes": notes,
+    }
+
+
+__all__ = ["Wedge", "FieldProfile", "PivotState", "plan_even_up", "plan_shuttle", "DEFAULT_MAX_DEPTH_IN", "norm", "cw",
+           "arc_contains", "degrees_to_go", "has_passed"]

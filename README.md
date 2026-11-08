@@ -89,6 +89,11 @@ read key (`X-API-Key`) and a JSON body of the same parameters (`pivot` = name or
 returns the same result, 400 for bad input, 422 when the planner refuses (with the reason),
 and 502 if FieldNET can't be reached.
 
+`POST /api/plan-shuttle` (read key) works out a shuttle from the pivot's position now and sends
+nothing. Body: `{pivot, fromDeg, toDeg, passes (null = leave on), waterOn, depthIn, first?, poll?}`.
+It answers 400 for bad input, 404 for an unknown pivot, 422 when it can't (off the strip, depth
+too light…) and 502 for FieldNET trouble. The engine plans a shuttle the same way when it starts.
+
 The dashboard's Irrigation pages read two more, also with the read key, both read only:
 
 - `GET /api/pivots/{id}/live` — everything the panel is set to (direction, water, speed and
@@ -280,6 +285,22 @@ short:
   so they never start a pump group fallback; the last step's stop does.
 - **Practice.** Practice programs work everything out and check every command
   with FieldNET, but send nothing.
+- **Shuttles.** These are started from a pivot's Irrigation page, and go back and forth over a strip
+  between two stops.
+  - **The strip** runs forward from the first stop to the second.
+  - **Passes:** 1 crosses once and stops, 2 goes over and back, and so on. *Leave on* keeps it
+    going, planned about 30 days ahead.
+  - **Water:** wet at a depth (no less than the pivot puts on at full speed), or dry at 100%.
+  - **Starting:** a shuttle starts the pivot itself, on the engine's next check. It's worked out
+    from the pivot's position then (`programs.plan_shuttle`). Pass 1 heads for the farther stop,
+    and from mid-strip it's a part pass.
+  - **When it can't start:** if the pivot isn't reporting, is in a fault, or is off the strip, the
+    shuttle pauses straight away instead of waiting. It must never start the pivot later on its own.
+  - **While it runs,** the usual rules apply. Each pass ends at a stop, with that stop as its
+    service stop, and turns round there on the move. The last pass stops there with the water
+    off. A stop by hand pauses it.
+  - **Practice shuttles** check pass 1 with FieldNET and end.
+  - **Storage:** a shuttle is saved as kind `custom` with `settings.kind = "shuttle"`.
 
 Positions are only as fresh as the panel's last report, so the engine estimates
 progress from the step's speed and asks the panel for a fresh position (the

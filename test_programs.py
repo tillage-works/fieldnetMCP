@@ -237,6 +237,60 @@ def test_random_fields_keep_the_safety_rules():
                     assert abs(w["after_in"] - plan["target_in"]) <= slack, (w, plan)
 
 
+# ── Shuttle ───────────────────────────────────────────────────────────
+
+
+def _shuttle(angle, passes, **kw):
+    from programs import plan_shuttle
+    return plan_shuttle(kw.pop("a", 100.0), kw.pop("b", 200.0), angle, passes, kw.pop("wet", True), kw.pop("depth", 0.5),
+                        kw.pop("full", 0.14), kw.pop("hours", 10.0), **kw)
+
+
+def test_shuttle_passes_bounce_between_the_stops():
+    p = _shuttle(100.0, 3)
+    assert [(s["direction"], s["start_deg"], s["end_deg"], s["transition"]) for s in p["steps"]] == [
+        ("forward", 100.0, 200.0, "stop"), ("reverse", 200.0, 100.0, "stop"), ("forward", 100.0, 200.0, "end")]
+    assert all(s["service_stop_deg"] == s["end_deg"] for s in p["steps"])
+    # 100° at 0.5" (28% speed) on a 10 h circle: 100/360 * 10 / 0.28 = 9.92 h a pass
+    assert abs(p["steps"][0]["hours"] - 9.92) < 0.02 and p["steps"][0]["speed_pct"] == 28.0
+    assert p["kind"] == "shuttle" and p["passes"] == 3 and p["shuttle"]["leave_on"] is False
+
+
+def test_one_pass_goes_across_and_stops():
+    p = _shuttle(200.0, 1)  # at the second stop: across to the first
+    assert [(s["direction"], s["end_deg"], s["transition"]) for s in p["steps"]] == [("reverse", 100.0, "end")]
+
+
+def test_shuttle_from_the_middle_and_over_north():
+    p = _shuttle(130.0, 2)  # 30° in: the farther stop is 200°
+    assert [(s["direction"], s["arc_deg"]) for s in p["steps"]] == [("forward", 70.0), ("reverse", 100.0)]
+    assert any("part pass" in n for n in p["notes"])
+    q = _shuttle(15.0, 2, a=350.0, b=20.0)  # the strip crosses north; 350° is the farther stop
+    assert [(s["direction"], s["start_deg"], s["end_deg"], s["arc_deg"]) for s in q["steps"]] == [
+        ("reverse", 15.0, 350.0, 25.0), ("forward", 350.0, 20.0, 30.0)]
+    assert _shuttle(5.0, 1, a=350.0, b=20.0)["steps"][0]["direction"] == "forward"  # halfway: forward
+    r = _shuttle(130.0, 1, first="reverse")
+    assert r["steps"][0]["direction"] == "reverse" and r["steps"][0]["end_deg"] == 100.0
+
+
+def test_shuttle_left_on_plans_weeks_ahead():
+    p = _shuttle(100.0, None, wet=False, depth=None)
+    assert p["shuttle"]["leave_on"] and p["total_hours"] >= 30 * 24 and p["steps"][-1]["transition"] == "end"
+    assert all(s["speed_pct"] == 100.0 and s["depth_in"] is None for s in p["steps"])
+    assert {s["direction"] for s in p["steps"][:2]} == {"forward", "reverse"}
+
+
+def test_shuttle_refuses_what_it_cant_do():
+    for kw, angle, passes in (({"a": 100.0, "b": 100.0}, 100.0, 2), ({}, 300.0, 2), ({}, 100.0, 0),
+                              ({"depth": 0.1}, 100.0, 2), ({"hours": 0}, 100.0, 2), ({"first": "sideways"}, 100.0, 1)):
+        try:
+            _shuttle(angle, passes, **kw)
+        except ValueError:
+            continue
+        raise AssertionError(f"should have refused {kw} at {angle} x{passes}")
+    assert _shuttle(201.5, 1)["steps"][0]["end_deg"] == 100.0  # within 2° of a stop counts as at it
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):
