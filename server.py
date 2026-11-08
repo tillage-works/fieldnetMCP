@@ -1823,6 +1823,114 @@ async def api_plan_shuttle(request: Request):
     return JSONResponse({**plan, "settings": settings})
 
 
+def field_acres(p: dict[str, Any]) -> float | None:
+    """A pivot's field, from its length (and its arc, for a partial circle): W-26's 299.6 m is 69.7 ac."""
+    r = p.get("system_length")
+    if not r:
+        return None
+    full = math.pi * float(r) ** 2 / M2_PER_AC
+    a, b = p.get("partial_start_angle") or 0, p.get("partial_end_angle") or 0
+    share = (_programs.cw(a, b) / 360.0) if a != b and _programs.cw(a, b) > 0 else 1.0
+    return round(full * share, 1)
+
+
+def applied_depth(wedges: list[dict[str, Any]]) -> dict[str, Any]:
+    """The field's average applied depth (span-weighted over the whole circle; unwatered counts as 0),
+    the driest and wettest wedge, and how much of the circle got water."""
+    covered = sum(w["span_deg"] for w in wedges if w.get("depth_in"))
+    total = sum((w.get("depth_in") or 0) * w["span_deg"] for w in wedges)
+    depths = [w["depth_in"] for w in wedges if w.get("depth_in")]
+    return {"applied_in": round(total / 360.0, 2), "covered_pct": round(covered / 3.6, 1),
+            "min_in": round(min(depths), 2) if depths and covered >= 359 else 0.0, "max_in": round(max(depths), 2) if depths else 0.0}
+
+
+_water_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+WATER_CACHE_S = 15 * 60
+
+
+async def water_report(start: date, end: date) -> dict[str, Any]:
+    """Every pivot's water over a range: hours run (FieldNET's overview report) and the applied depth from
+    its applied-irrigation map (FieldNET's own depth and volume are 0 without a flow meter), with acres and
+    acre-inches. Maps are only read for pivots that ran. Cached for 15 minutes."""
+    key = (start.isoformat(), end.isoformat())
+    hit = _water_cache.get(key)
+    if hit and time.time() - hit[0] < WATER_CACHE_S:
+        return hit[1]
+    overview = {r.get("pivot"): r for r in await irrigation_overview(start.isoformat(), end.isoformat())}
+    pivots = await get_pivots(max_age_s=600)
+    sem = asyncio.Semaphore(6)
+
+    async def one(p: dict[str, Any]) -> dict[str, Any]:
+        o = overview.get(p.get("name")) or {}
+        hours = float(o.get("hours_run") or 0)
+        acres = field_acres(p)
+        row: dict[str, Any] = {"id": p.get("id"), "name": p.get("name"), "lat": p.get("latitude"), "lon": p.get("longitude"),
+                               "acres": acres, "hours_run": round(hours, 1), "applied_in": 0.0, "covered_pct": 0.0,
+                               "min_in": 0.0, "max_in": 0.0, "acre_in": 0.0}
+        if o.get("error"):
+            row["error"] = "Couldn't read its hours from FieldNET."
+        if hours > 0:
+            async with sem:
+                try:
+                    row.update(applied_depth(await _applied_wedges(p["id"], start, end)))
+                except Exception as e:  # noqa: BLE001
+                    print(f"WATER applied error {p.get('name')}: {type(e).__name__}: {e}", flush=True)
+                    row["error"] = "Couldn't read its applied-water map from FieldNET."
+            row["acre_in"] = round(row["applied_in"] * acres, 1) if acres else None
+        return row
+
+    rows = sorted(await asyncio.gather(*(one(p) for p in pivots)), key=lambda r: r.get("name") or "")
+    ran = [r for r in rows if r["hours_run"] > 0]
+    out = {"from": start.isoformat(), "to": end.isoformat(), "pivots": rows,
+           "totals": {"hours_run": round(sum(r["hours_run"] for r in rows), 1),
+                      "acre_in": round(sum(r["acre_in"] or 0 for r in rows), 1), "pivots_run": len(ran)},
+           "made_at": datetime.now(TZ).isoformat(timespec="seconds")}
+    _water_cache[key] = (time.time(), out)
+    return out
+
+
+async def api_water(request: Request):
+    """GET /api/water?from=YYYY-MM-DD&to=YYYY-MM-DD (read key): every pivot's water over the range (default the
+    last 7 days): hours run, applied depth from its map, acres and acre-inches. Read only; cached 15 minutes.
+    → 200 · 400 bad dates · 502 FieldNET trouble"""
+    q = request.query_params
+    for k in ("from", "to"):
+        if q.get(k):
+            try:
+                date.fromisoformat(q[k])
+            except ValueError:
+                return JSONResponse({"error": f"{k} must be a date like 2026-09-24."}, status_code=400)
+    start, end = _range(q.get("from"), q.get("to"), 6)
+    if (end - start).days > 400:
+        return JSONResponse({"error": "That range is too long (400 days at most)."}, status_code=400)
+    try:
+        return JSONResponse(await water_report(start, end))
+    except Exception as e:  # noqa: BLE001
+        print(f"WATER error: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't read FieldNET's reports right now."}, status_code=502)
+
+
+async def api_pivot_daily(request: Request):
+    """GET /api/pivots/{id}/daily?from&to (read key): a pivot's hours run per day (FieldNET's daily report),
+    default the last 14 days. → 200 · 400 · 404 · 502"""
+    q = request.query_params
+    for k in ("from", "to"):
+        if q.get(k):
+            try:
+                date.fromisoformat(q[k])
+            except ValueError:
+                return JSONResponse({"error": f"{k} must be a date like 2026-09-24."}, status_code=400)
+    try:
+        await resolve_pivot(request.path_params["pivot_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    try:
+        return JSONResponse(await daily_report(request.path_params["pivot_id"], q.get("from"), q.get("to")))
+    except Exception as e:  # noqa: BLE001
+        print(f"DAILY error: {type(e).__name__}: {e}", flush=True)
+        return JSONResponse({"error": "Couldn't read FieldNET's daily report right now."}, status_code=502)
+
+
 app = mcp.streamable_http_app()
 # Second URL for the same MCP endpoint, so a separate "FieldNET Control"
 # connector can be added in Claude (it won't accept two connectors with the
@@ -1834,6 +1942,8 @@ app.add_route("/", health, methods=["GET"])
 app.add_route("/health", health, methods=["GET"])
 app.add_route("/api/plan-even-up", api_plan_even_up, methods=["POST"])
 app.add_route("/api/plan-shuttle", api_plan_shuttle, methods=["POST"])
+app.add_route("/api/water", api_water, methods=["GET"])
+app.add_route("/api/pivots/{pivot_id}/daily", api_pivot_daily, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/live", api_pivot_live, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/applied", api_pivot_applied, methods=["GET"])
 app.add_route("/api/pivots/{pivot_id}/control", api_pivot_control, methods=["POST"])
