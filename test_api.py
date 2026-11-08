@@ -576,6 +576,63 @@ def asyncio_run(coro):
     return asyncio.run(coro)
 
 
+def test_water_report():
+    fake_fieldnet()
+    calls = []
+    server._water_cache.clear()
+
+    async def overview(from_date=None, to_date=None, pivots=None):
+        return [{"pivot": "W-26", "hours_run": 72.4}, {"pivot": "K-15", "hours_run": 0}]
+
+    async def pivots(max_age_s=60):
+        return [dict(W26, system_length=299.6184, latitude=47.16, longitude=-119.05),
+                {"id": "k15", "name": "K-15", "system_length": 400.0, "partial_start_angle": 90, "partial_end_angle": 270}]
+
+    async def applied(pid, start, end):
+        calls.append(pid)
+        return WEDGES
+
+    saved = (server.irrigation_overview, server.get_pivots, server._applied_wedges)
+    server.irrigation_overview, server.get_pivots, server._applied_wedges = overview, pivots, applied
+    try:
+        r = client.get("/api/water?from=2026-11-01&to=2026-11-07", headers=KEY)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        w26 = next(p for p in d["pivots"] if p["name"] == "W-26")
+        k15 = next(p for p in d["pivots"] if p["name"] == "K-15")
+        # W-26 real Nov wedges: (3.5*31.1 + 3.46*44.1 + 2.99*218.9 + 3.7*65.9) / 360 = 1159.8 / 360 = 3.22"
+        assert w26["acres"] == 69.7 and w26["applied_in"] == 3.22 and w26["covered_pct"] == 100.0, w26
+        assert w26["min_in"] == 2.99 and w26["max_in"] == 3.7 and w26["acre_in"] == round(3.22 * 69.7, 1)
+        assert k15["applied_in"] == 0 and k15["acres"] == round(3.14159265 * 400 ** 2 / 4046.856 / 2, 1)  # half circle
+        assert calls == ["c6f28e12"]  # maps only for pivots that ran
+        assert d["totals"] == {"hours_run": 72.4, "acre_in": w26["acre_in"], "pivots_run": 1}
+        client.get("/api/water?from=2026-11-01&to=2026-11-07", headers=KEY)
+        assert calls == ["c6f28e12"]  # cached
+        assert client.get("/api/water?from=nope", headers=KEY).status_code == 400
+        assert client.get("/api/water?from=2024-01-01&to=2026-11-07", headers=KEY).status_code == 400
+        assert client.get("/api/water").status_code == 401
+    finally:
+        server.irrigation_overview, server.get_pivots, server._applied_wedges = saved
+        server._water_cache.clear()
+
+
+def test_pivot_daily_endpoint():
+    fake_fieldnet()
+
+    async def daily(pivot, from_date=None, to_date=None):
+        return {"pivot": "W-26", "from": from_date, "to": to_date, "total_hours": 45.0,
+                "days": [{"date": "2026-11-03", "hours_run": 20.5}, {"date": "2026-11-04", "hours_run": 24.5}]}
+
+    real, server.daily_report = server.daily_report, daily
+    try:
+        r = client.get("/api/pivots/W-26/daily?from=2026-11-03&to=2026-11-04", headers=KEY)
+        assert r.status_code == 200 and r.json()["total_hours"] == 45.0
+        assert client.get("/api/pivots/W-99/daily", headers=KEY).status_code == 404
+        assert client.get("/api/pivots/W-26/daily?to=x", headers=KEY).status_code == 400
+    finally:
+        server.daily_report = real
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):

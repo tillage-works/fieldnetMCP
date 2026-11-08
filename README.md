@@ -89,6 +89,15 @@ read key (`X-API-Key`) and a JSON body of the same parameters (`pivot` = name or
 returns the same result, 400 for bad input, 422 when the planner refuses (with the reason),
 and 502 if FieldNET can't be reached.
 
+**Water** (read key, read only), for the dashboard's Irrigation › Water page:
+- **`GET /api/water?from&to`** returns every pivot's water over the range (default the last 7
+  days): hours run (FieldNET's overview report), and the applied depth averaged over the circle
+  from its applied-irrigation map. FieldNET's own depth and volume are 0 on these pivots, which
+  have no flow meter set up. Also the driest and wettest wedge, how much of the circle got water,
+  acres (from the pivot's length, and its arc for a partial circle; W-26: 69.7 ac) and acre-inches.
+  Maps are read only for pivots that ran. It's cached for 15 minutes, with 400 days at most.
+- **`GET /api/pivots/{id}/daily?from&to`** returns a pivot's hours run per day (default 14 days).
+
 `POST /api/plan-shuttle` (read key) works out a shuttle from the pivot's position now and sends
 nothing. Body: `{pivot, fromDeg, toDeg, passes (null = leave on), waterOn, depthIn, first?, poll?}`.
 It answers 400 for bad input, 404 for an unknown pivot, 422 when it can't (off the strip, depth
