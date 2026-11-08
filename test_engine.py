@@ -656,6 +656,77 @@ def test_polls_only_near_changes():
     assert len(polls) <= hours * 30 + 40, len(polls)
 
 
+# ---------------------------------------------------------------------------
+# Shuttles
+# ---------------------------------------------------------------------------
+
+
+class ShuttleSim(Sim):
+    async def plan(self, pid, s):
+        """What server._engine_plan does for a shuttle: the planner, from the pivot's position."""
+        return P.plan_shuttle(s["fromDeg"], s["toDeg"], self.angle, s.get("passes"), s["waterOn"], s.get("depthIn"),
+                              D_FULL, CIRCLE_H, s.get("first"))
+
+
+def shuttle_setup(sim, passes=3, mode="live", allow_live=True, a=100.0, b=200.0, wet=True, depth=0.5):
+    store, eng = setup(sim, mode=mode, allow_live=allow_live)
+    prog = store.programs[1]["p"]
+    prog.name = "Shuttle"
+    prog.settings = {"kind": "shuttle", "fromDeg": a, "toDeg": b, "passes": passes, "waterOn": wet, "depthIn": depth}
+    prog.approved = {}
+    return store, eng
+
+
+def test_shuttle_starts_a_stopped_pivot_and_turns_round_on_the_move():
+    sim = ShuttleSim(angle=100.0, direction="stopped", water=False, depth=0.5)
+    store, eng = shuttle_setup(sim, passes=3)
+
+    async def go_():
+        await run_for(sim, eng, 40, until=lambda: store.programs[1]["state"] != "running" and store.runs)
+
+    go(go_())
+    assert store.programs[1]["state"] == "finished", (store.programs[1], store.kinds())
+    assert [c["direction"] for c in sim.sent[:3]] == ["forward", "reverse", "forward"]
+    assert all(c["service_stop_deg"] in (100.0, 200.0) for c in sim.sent[:3])
+    stops = [(st, round(a)) for st, a in sim.statuses if st in ("service-stop", "stopped")]
+    assert stops[0] == ("service-stop", 200), stops  # it never stopped to turn round: the only stop is the last one
+    assert abs(sim.angle - 200.0) < 2.5 and not sim.water  # finished at the second stop, water off
+    assert "started" in store.kinds() and "finished" in store.kinds()
+    assert "back and forth between 100.0° and 200.0°, 3 passes" in store.events[0]["message"]
+
+
+def test_shuttle_left_on_keeps_going_until_stopped():
+    sim = ShuttleSim(angle=150.0, direction="stopped", water=False, depth=0.5)
+    store, eng = shuttle_setup(sim, passes=None)
+    go(run_for(sim, eng, 36, events={30: sim.manual_stop}))
+    turns = [c for c in sim.sent if c["direction"] in ("forward", "reverse")]
+    assert len(turns) >= 3 and store.programs[1]["state"] == "paused"  # bounced, then the manual stop won
+    assert "stopped" in store.kinds()
+
+
+def test_shuttle_wont_start_or_wait_when_it_cant():
+    for setup_fn, why in ((lambda s: setattr(s, "online", False), "isn't reporting"),
+                          (lambda s: s.set_status("alignment-fault"), "is in alignment-fault")):
+        sim = ShuttleSim(angle=100.0, direction="stopped", water=False, depth=0.5)
+        setup_fn(sim)
+        store, eng = shuttle_setup(sim)
+        go(eng.tick())
+        assert store.programs[1]["state"] == "paused" and why in store.programs[1]["reason"], store.programs[1]
+        assert not sim.sent and not store.runs
+    sim = ShuttleSim(angle=300.0, direction="stopped", water=False, depth=0.5)  # off the strip
+    store, eng = shuttle_setup(sim)
+    go(eng.tick())
+    assert store.programs[1]["state"] == "paused" and "off the strip" in store.programs[1]["reason"] and not sim.sent
+
+
+def test_practice_shuttle_checks_pass_one_and_ends():
+    sim = ShuttleSim(angle=100.0, direction="stopped", water=False, depth=0.5)
+    store, eng = shuttle_setup(sim, mode="practice")
+    go(eng.tick())
+    assert not sim.sent and sim.previews == 1
+    assert store.programs[1]["state"] == "finished" and store.kinds()[-1] == "practice-done"
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):

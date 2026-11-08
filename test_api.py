@@ -539,6 +539,43 @@ def test_endgun_switch_refuses_what_it_cant_do():
         restore()
 
 
+def test_plan_shuttle_endpoint():
+    fake_fieldnet()
+    polls = []
+
+    async def observe(pid, poll):
+        polls.append(poll)
+        return {"current_angle": 100.0, "rate_conversion_factor": 0.1417 / server.IN_PER_M, "full_run_time": 10.05 * 3600,
+                "_fresh": poll}
+
+    real, server._engine_observe = server._engine_observe, observe
+    try:
+        body = {"pivot": "W-26", "fromDeg": 100, "toDeg": 200, "passes": 2, "waterOn": True, "depthIn": 0.5}
+        r = client.post("/api/plan-shuttle", json=body, headers=KEY)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["kind"] == "shuttle" and d["pivot"] == "W-26" and [s["direction"] for s in d["steps"]] == ["forward", "reverse"]
+        assert d["settings"] == {"kind": "shuttle", "fromDeg": 100.0, "toDeg": 200.0, "passes": 2, "waterOn": True,
+                                 "depthIn": 0.5, "first": None} and polls == [True] and d["position_as_of"]
+        assert client.post("/api/plan-shuttle", json={**body, "passes": None}, headers=KEY).json()["shuttle"]["leave_on"]
+        for bad in ({**body, "passes": 0}, {**body, "fromDeg": 400}, {**body, "depthIn": None}, {**body, "first": "up"}):
+            assert client.post("/api/plan-shuttle", json=bad, headers=KEY).status_code == 400, bad
+        assert client.post("/api/plan-shuttle", json={**body, "fromDeg": 250, "toDeg": 300}, headers=KEY).status_code == 422
+        assert client.post("/api/plan-shuttle", json={**body, "pivot": "W-99"}, headers=KEY).status_code == 404
+        assert client.post("/api/plan-shuttle", json=body).status_code == 401
+        # The engine works a shuttle out the same way at start.
+        plan = asyncio_run(server._engine_plan("W-26", d["settings"]))
+        assert plan["kind"] == "shuttle" and plan["passes"] == 2
+    finally:
+        server._engine_observe = real
+
+
+def asyncio_run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in list(globals().items()):
